@@ -1,0 +1,67 @@
+{
+  "project": "dsh-dev-loop",
+  "branchName": "main",
+  "description": "Bounded Planner -> DSH Codex Executor -> Reviewer loop with Bridge attachments and auditable artifacts.",
+  "userStories": [
+    {
+      "id": "DL-001",
+      "title": "Create bounded artifact manifests and project packages",
+      "description": "Generate run-scoped ZIP and JSON/Markdown artifacts under a safe local root with canonical-path, byte-limit, hash, and provenance checks.",
+      "acceptanceCriteria": [
+        "Each artifact has runId, stage, name, mime, bytes, sha256, and source.",
+        "Symlink escape and oversized artifacts are rejected.",
+        "Packaging never writes into or cleans the product repository."
+      ],
+      "priority": 1,
+      "passes": false
+    },
+    {
+      "id": "DL-002",
+      "title": "Implement the fixed bounded state machine",
+      "description": "Route Planner, approval, execution, evidence, and Reviewer phases through explicit states and one automatic NEEDS_FIX budget.",
+      "acceptanceCriteria": [
+        "Invalid transitions fail closed.",
+        "ACCEPTED, NEEDS_FIX, NEEDS_REPLAN, DEFER, and ESCALATE route deterministically.",
+        "A second automatic NEEDS_FIX cannot execute."
+      ],
+      "priority": 2,
+      "passes": false
+    },
+    {
+      "id": "DL-003",
+      "title": "Connect DSH Codex subscription execution",
+      "description": "Drive an Executor Agent through the installed dsh-codex-subscription openai-codex route using gpt-5.6-luna and the approved danger-full-access DSH permission preset.",
+      "acceptanceCriteria": [
+        "The adapter uses the DSH Agent/LLM runtime rather than a second shell or ChatGPT execution plane.",
+        "The executor cwd is the configured product repository.",
+        "Executor output, cancellation, and failure become reportable evidence."
+      ],
+      "priority": 3,
+      "passes": false
+    },
+    {
+      "id": "DL-004",
+      "title": "Add Bridge attachment transport",
+      "description": "Extend DSH-Brain-Bridge CDP worker transport to select allowlisted local artifacts, wait for visible upload completion, send one prompt, and recover idempotently.",
+      "acceptanceCriteria": [
+        "DOM.setFileInputFiles is used only after local manifest and hash validation.",
+        "The prompt is not sent while any attachment is uploading.",
+        "Retry, timeout, page refresh, and worker restart have explicit outcomes without duplicate submission."
+      ],
+      "priority": 4,
+      "passes": false
+    },
+    {
+      "id": "DL-005",
+      "title": "Validate the deterministic first-phase loop",
+      "description": "Add fake Bridge, fake DSH Executor, CDP mock, and evidence tests; isolate any real smoke behind an explicit bounded command.",
+      "acceptanceCriteria": [
+        "Fixture marker round trips through Planner and Reviewer fake transport.",
+        "Report, diff, and latest project ZIP are attached in Reviewer order.",
+        "Default tests use no production account or Codex quota."
+      ],
+      "priority": 5,
+      "passes": false
+    }
+  ]
+}

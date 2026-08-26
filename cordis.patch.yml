@@ -1,0 +1,9 @@
+# Optional DSH profile overlay. It mounts only the Controller host adapter;
+# the active dsh-codex-subscription provider remains the model authority.
+- insert:
+    - id: dev-loop-controller
+      name: 'dsh-dev-loop'
+      config:
+        provider: 'openai-codex'
+        model: 'gpt-5.6-luna'
+        permissionPreset: 'danger-full-access'

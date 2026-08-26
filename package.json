@@ -1,0 +1,27 @@
+{
+  "name": "dsh-dev-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded Planner -> DSH Codex Executor -> Reviewer controller",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./plugin": "./src/plugin.mjs",
+    "./package.json": "./package.json"
+  },
+  "keywords": ["dsh-plugin", "deepseek-harness", "openai-codex", "development-loop"],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.1-rc.1",
+    "@deepseek-ai/dsh-session": ">=0.1.1-rc.1"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:watch": "node --test --watch tests/*.test.mjs",
+    "package:fixture": "node bin/dsh-dev-loop.mjs package --project . --output artifacts/fixture"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
