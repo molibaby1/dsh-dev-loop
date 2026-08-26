@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import { ArtifactStore } from './artifacts.mjs'
 import { BridgeClient } from './bridge-client.mjs'
 import { DevLoopController } from './controller.mjs'
@@ -16,7 +17,7 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
   }).init()
   const bridge = new BridgeClient({
     baseUrl: config.bridgeBaseUrl,
-    token: config.bridgeToken,
+    token: await resolveBridgeToken(config),
     timeoutMs: config.bridgeTimeoutMs,
   })
   const executor = createDshCodexExecutor({
@@ -36,4 +37,17 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
     evidenceCollector,
     maxFixes: 1,
   })
+}
+
+async function resolveBridgeToken(config) {
+  if (typeof config.bridgeToken === 'string' && config.bridgeToken) return config.bridgeToken
+  if (!config.bridgeTokenFile) return config.bridgeToken ?? ''
+  const raw = await readFile(config.bridgeTokenFile, 'utf8')
+  try {
+    const parsed = JSON.parse(raw)
+    if (typeof parsed.staticToken === 'string' && parsed.staticToken) return parsed.staticToken
+  } catch {}
+  const token = raw.trim()
+  if (!token) throw new Error('bridgeTokenFile is empty')
+  return token
 }

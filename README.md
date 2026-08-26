@@ -67,6 +67,8 @@ export DSH_DEV_LOOP_PROJECT_ROOT=/absolute/path/to/project
 export DSH_DEV_LOOP_ARTIFACT_ROOT=/absolute/path/to/dsh-dev-loop/artifacts
 export DSH_BRIDGE_URL=http://127.0.0.1:7688
 export DSH_BRIDGE_TOKEN="$DSH_MCP_STATIC_TOKEN"
+# Or use a local JSON/token file when the already-running host cannot inherit env:
+export DSH_BRIDGE_TOKEN_FILE=/absolute/path/to/bridge/config.json
 dsh plugin --profile web add /absolute/path/to/dsh-dev-loop
 dsh --profile web --patch /absolute/path/to/dsh-dev-loop/cordis.patch.yml
 ```
@@ -80,6 +82,15 @@ that the human approved the Planner output for this run:
 
 The command never accepts local paths inside the prompt; project and artifact roots come from
 profile configuration or validated command fields. Do not apply this overlay to headless profiles.
+
+### Zero-downtime activation
+
+A long-running `dsh web` process can hot-load the dependency-free
+`src/live-plugin.mjs` entry when its profile patch watcher is active. The entry imports the installed
+package only when `/dev-loop` is invoked, avoiding a host restart. The live profile must set
+`modulePath` to the installed package's `src/index.mjs` and may use `bridgeTokenFile` when the
+already-running host cannot inherit a new environment variable. This is the safe path for an
+existing GUI; do not kill or replace its `3080` process.
 
 ## Artifacts and security
 

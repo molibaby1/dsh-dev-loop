@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.mjs",
     "./plugin": "./src/plugin.mjs",
+    "./live-plugin": "./src/live-plugin.mjs",
     "./package.json": "./package.json"
   },
   "keywords": ["dsh-plugin", "deepseek-harness", "openai-codex", "development-loop"],

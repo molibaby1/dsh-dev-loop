@@ -14,6 +14,7 @@ export function apply(ctx, config = {}) {
     permissionPreset: config.permissionPreset ?? 'danger-full-access',
     bridgeBaseUrl: config.bridgeBaseUrl ?? process.env.DSH_BRIDGE_URL ?? 'http://127.0.0.1:7688',
     bridgeToken: config.bridgeToken ?? process.env.DSH_BRIDGE_TOKEN ?? '',
+    bridgeTokenFile: config.bridgeTokenFile ?? process.env.DSH_BRIDGE_TOKEN_FILE,
     artifactRoot: config.artifactRoot ?? process.env.DSH_DEV_LOOP_ARTIFACT_ROOT,
     projectRoot: config.projectRoot ?? process.env.DSH_DEV_LOOP_PROJECT_ROOT,
   }
