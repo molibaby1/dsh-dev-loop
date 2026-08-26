@@ -1,20 +1,29 @@
 import { createDshDevLoopController } from './host.mjs'
 import { createDshCodexExecutor } from './dsh-executor.mjs'
+import { createDevLoopCommand } from './command.mjs'
 
 /**
  * DSH composition entry. The Controller remains independent, while this small
  * host adapter exposes the installed subscription route inside a DSH context.
  */
 export function apply(ctx, config = {}) {
-  const executor = createDshCodexExecutor({
-    ctx,
+  const effectiveConfig = {
+    ...config,
     provider: config.provider ?? 'openai-codex',
     model: config.model ?? 'gpt-5.6-luna',
     permissionPreset: config.permissionPreset ?? 'danger-full-access',
-  })
+    bridgeBaseUrl: config.bridgeBaseUrl ?? process.env.DSH_BRIDGE_URL ?? 'http://127.0.0.1:7688',
+    bridgeToken: config.bridgeToken ?? process.env.DSH_BRIDGE_TOKEN ?? '',
+    artifactRoot: config.artifactRoot ?? process.env.DSH_DEV_LOOP_ARTIFACT_ROOT,
+    projectRoot: config.projectRoot ?? process.env.DSH_DEV_LOOP_PROJECT_ROOT,
+  }
+  const executor = createDshCodexExecutor({ ...effectiveConfig, ctx })
   ctx.provide('dshDevLoopExecutor', executor)
   ctx.provide('dshDevLoopController', {
-    create: controllerConfig => createDshDevLoopController({ ctx, config: controllerConfig }),
+    create: controllerConfig => createDshDevLoopController({ ctx, config: { ...effectiveConfig, ...controllerConfig } }),
+  })
+  ctx.inject(['commands'], commandCtx => {
+    commandCtx.commands.register(createDevLoopCommand({ ctx, config: effectiveConfig }))
   })
 }
 

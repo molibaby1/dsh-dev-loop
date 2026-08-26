@@ -7,3 +7,7 @@
         provider: 'openai-codex'
         model: 'gpt-5.6-luna'
         permissionPreset: 'danger-full-access'
+        projectRoot: !!js process.env.DSH_DEV_LOOP_PROJECT_ROOT
+        artifactRoot: !!js process.env.DSH_DEV_LOOP_ARTIFACT_ROOT
+        bridgeBaseUrl: !!js process.env.DSH_BRIDGE_URL || 'http://127.0.0.1:7688'
+        bridgeToken: !!js process.env.DSH_BRIDGE_TOKEN || ''

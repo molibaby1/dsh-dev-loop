@@ -57,6 +57,30 @@ The low-level `streamCodex()` helper pins the same provider/model when a host ne
 `ctx.llm.stream()` call. Normal repository execution should use the Agent adapter so DSH tools
 and session evidence remain authoritative.
 
+### Direct Web-profile usage
+
+The Web-profile overlay registers `/dev-loop`. Install the local package into the existing Web
+profile, then apply the explicit overlay when that profile is launched:
+
+```bash
+export DSH_DEV_LOOP_PROJECT_ROOT=/absolute/path/to/project
+export DSH_DEV_LOOP_ARTIFACT_ROOT=/absolute/path/to/dsh-dev-loop/artifacts
+export DSH_BRIDGE_URL=http://127.0.0.1:7688
+export DSH_BRIDGE_TOKEN="$DSH_MCP_STATIC_TOKEN"
+dsh plugin --profile web add /absolute/path/to/dsh-dev-loop
+dsh --profile web --patch /absolute/path/to/dsh-dev-loop/cordis.patch.yml
+```
+
+In the DSH Web composer, run one explicit JSON command. `approve:true` is mandatory and means
+that the human approved the Planner output for this run:
+
+```text
+/dev-loop {"problemPackage":{"id":"problem-1","summary":"Describe the bounded task"},"approve":true,"executorTask":"Implement only the requested change"}
+```
+
+The command never accepts local paths inside the prompt; project and artifact roots come from
+profile configuration or validated command fields. Do not apply this overlay to headless profiles.
+
 ## Artifacts and security
 
 Run artifacts are written to a Controller-owned root. ZIP packaging is deterministic and
