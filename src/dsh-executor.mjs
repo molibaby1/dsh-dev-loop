@@ -1,5 +1,5 @@
 const EXECUTOR_PROVIDER = 'openai-codex'
-const EXECUTOR_MODEL = 'gpt-5.6-luna'
+const EXECUTOR_MODEL = 'gpt-6-luna'
 
 export async function* streamCodex(ctx, options = {}) {
   if (!ctx?.llm?.stream) throw new Error('DSH LLM stream service is required')
@@ -15,7 +15,7 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
   return {
     provider,
     model,
-    async execute({ runId, cwd, task, signal }) {
+    async execute({ runId, cwd, task, signal, onProgress }) {
       if (typeof task !== 'string' || task.trim() === '') throw new Error('executor task must be non-empty')
       if (signal?.aborted) throw new Error('executor request was aborted before start')
       let makeSessionId = sessionIdFactory
@@ -29,29 +29,42 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
         makeMessage ??= createUserMessage
       }
       const sessionId = makeSessionId(`dev-loop-${runId}`)
+      const agentPresets = ctx.agentPresets ?? ctx.get?.('agentPresets')
+      if (!agentPresets?.mount) throw new Error('DSH Agent preset service is required for Executor')
       const handle = await ctx.agents.create({
         sessionId,
         meta: { cwd },
         agentOptions: { provider, model },
+        setup: async agentCtx => {
+          await agentPresets.mount(agentCtx)
+        },
       })
       const agent = handle.agent
+      let cancelled = false
+      const onAbort = () => {
+        if (cancelled) return
+        cancelled = true
+        try { agent.cancel({ kind: 'user', message: 'Controller cancelled the Executor run' }) } catch {}
+      }
+      if (signal?.aborted) onAbort()
+      else signal?.addEventListener('abort', onAbort, { once: true })
       try {
         if (ctx.permissionPresets?.set) {
           ctx.permissionPresets.set(agent.session, permissionPreset)
         } else {
           throw new Error('DSH permission preset service is required for Executor')
         }
+        if (cancelled) throw abortExecutorError()
         const firstSeq = agent.session.seq
+        onProgress?.({ status: 'started', runId })
         agent.followup(makeMessage({
           content: [{ type: 'text', text: task }],
           source: { kind: 'user' },
         }))
         await agent.whenIdle()
-        if (signal?.aborted) {
-          agent.cancel({ kind: 'user', message: 'Controller cancelled the Executor run' })
-          throw new Error('executor run was aborted')
-        }
+        if (signal?.aborted || cancelled) throw abortExecutorError()
         const events = agent.session.events.filter(event => event.seq > firstSeq)
+        onProgress?.({ status: 'completed', runId })
         return {
           runId,
           provider,
@@ -61,10 +74,18 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
           events,
         }
       } finally {
+        signal?.removeEventListener('abort', onAbort)
         await handle.dispose()
       }
     },
   }
+}
+
+function abortExecutorError() {
+  const error = new Error('executor run was aborted')
+  error.name = 'AbortError'
+  error.code = 'CANCELLED'
+  return error
 }
 
 function lastAssistantText(events) {

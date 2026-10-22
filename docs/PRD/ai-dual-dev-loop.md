@@ -10,8 +10,8 @@ Implement one bounded, evidence-driven run:
 
 1. Package a small project artifact.
 2. Send a Planner request with the artifact through the Bridge attachment transport.
-3. Validate the Planner plan and wait for explicit approval.
-4. Execute the approved task through a DSH Agent using `openai-codex` / `gpt-5.6-luna`.
+3. Validate the Planner plan and authorize it automatically for the Web command (or wait for explicit approval when `autoApprove: false`).
+4. Execute the authorized task through a DSH Agent using `openai-codex` / `gpt-5.6-luna`.
 5. Collect report, diff, test result, and a fresh project artifact.
 6. Send those artifacts to a Reviewer through the Bridge attachment transport.
 7. Route one structured decision to `COMPLETE`, `EXECUTING`, `ANALYZING`, `WAITING`, or `STOPPED`.
@@ -40,8 +40,8 @@ Implement one bounded, evidence-driven run:
 IDLE
   -> ANALYZING
   -> PLAN_READY
-  -> WAITING_FOR_APPROVAL
-  -> EXECUTING
+  -> EXECUTING (Web command auto-approval)
+  -> WAITING_FOR_APPROVAL (when autoApprove is false)
   -> COLLECTING_EVIDENCE
   -> REVIEWING
 

@@ -6,11 +6,14 @@
       config:
         modulePath: 'dsh-dev-loop'
         provider: 'openai-codex'
-        model: 'gpt-5.6-luna'
+        model: 'gpt-6-luna'
         permissionPreset: 'danger-full-access'
+        autoApprove: false
         projectRoot: !!js process.env.DSH_DEV_LOOP_PROJECT_ROOT
         artifactRoot: !!js process.env.DSH_DEV_LOOP_ARTIFACT_ROOT
         bridgeBaseUrl: !!js process.env.DSH_BRIDGE_URL || 'http://127.0.0.1:7688'
         bridgeToken: !!js process.env.DSH_BRIDGE_TOKEN || ''
         bridgeTokenFile: !!js process.env.DSH_BRIDGE_TOKEN_FILE
-        bridgeTokenFile: !!js process.env.DSH_BRIDGE_TOKEN_FILE
+    - id: dev-loop-ui
+      name: 'dsh-dev-loop-ui'
+      config: {}

@@ -33,15 +33,30 @@ async function makeController(responses) {
   return { controller, project }
 }
 
-test('Controller rejects unsupported Planner fields', async () => {
+test('Controller persists unsupported Planner fields as a diagnostic failure', async () => {
   const { controller, project } = await makeController({ planner: { executorTask: 'task', unsupported: true } })
-  await assert.rejects(controller.run({ projectRoot: project, problemPackage: { id: 'problem' } }), /unsupported fields/)
+  const result = await controller.run({ projectRoot: project, problemPackage: { id: 'problem' } })
+  assert.equal(result.state, 'FAILED')
+  assert.equal(result.diagnostic.code, 'PLANNER_PROTOCOL_INVALID')
+  assert.match(result.diagnostic.technical.message, /unsupported fields/)
 })
 
-test('Controller rejects unsupported Reviewer decisions', async () => {
+test('Controller accepts structured Planner metadata', async () => {
+  const { controller, project } = await makeController({
+    planner: { executorTask: 'task', targetBehavior: ['safe'], focusedTests: ['focused'] },
+    'reviewer-0': { decision: 'ACCEPTED' },
+  })
+  const result = await controller.run({ projectRoot: project, problemPackage: { id: 'problem' }, approval: true })
+  assert.equal(result.state, 'COMPLETE')
+})
+
+test('Controller persists unsupported Reviewer decisions as a diagnostic failure', async () => {
   const { controller, project } = await makeController({
     planner: { executorTask: 'task' },
     'reviewer-0': { decision: 'UNKNOWN' },
   })
-  await assert.rejects(controller.run({ projectRoot: project, problemPackage: { id: 'problem' }, approval: true }), /invalid review decision/)
+  const result = await controller.run({ projectRoot: project, problemPackage: { id: 'problem' }, approval: true })
+  assert.equal(result.state, 'FAILED')
+  assert.equal(result.diagnostic.code, 'REVIEWER_PROTOCOL_INVALID')
+  assert.match(result.diagnostic.technical.message, /invalid review decision/)
 })

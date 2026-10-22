@@ -40,7 +40,7 @@ async function runCommand(values) {
   const bridge = new BridgeClient({
     baseUrl: option(values, '--bridge-url') ?? process.env.DSH_BRIDGE_URL ?? 'http://127.0.0.1:7688',
     token: option(values, '--bridge-token') ?? process.env.DSH_BRIDGE_TOKEN ?? '',
-    timeoutMs: Number(option(values, '--bridge-timeout-ms') ?? 120_000),
+    timeoutMs: Number(option(values, '--bridge-timeout-ms') ?? 300_000),
   })
   const testCommand = parseTestCommand(option(values, '--test-command'))
   const evidenceCollector = createEvidenceCollector({ store, testCommand })

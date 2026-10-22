@@ -103,6 +103,26 @@ export class ArtifactStore {
     return this.writeText({ ...options, mime: options.mime ?? 'application/json', text: `${JSON.stringify(options.value, null, 2)}\n` })
   }
 
+  async readJson({ runId, name }) {
+    return JSON.parse((await this.#readBytes({ runId, name })).toString('utf8'))
+  }
+
+  async verifyJson({ runId, name, sha256 }) {
+    const bytes = await this.#readBytes({ runId, name })
+    const actual = createHash('sha256').update(bytes).digest('hex')
+    if (sha256 && actual !== sha256) throw new Error(`artifact hash changed: ${name}`)
+    return JSON.parse(bytes.toString('utf8'))
+  }
+
+  async #readBytes({ runId, name }) {
+    const root = await this.runRoot(runId)
+    const pathValue = join(root, safeArtifactName(name))
+    const canonical = await canonicalExisting(pathValue, 'artifact')
+    if (!isInside(root, canonical)) throw new Error('artifact read path escapes run root')
+    await assertRegularFile(canonical, 'artifact')
+    return readFile(canonical)
+  }
+
   async stageFile({ runId, stage, name, mime, sourcePath, source = 'controller' }) {
     const root = await this.runRoot(runId)
     const canonicalSource = await canonicalExisting(sourcePath, 'artifact source')

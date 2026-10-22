@@ -15,6 +15,7 @@ test('BridgeClient waits for visible attachment worker completion', async () => 
       return polls === 1 ? response({ id: 'attachment-1', status: 'running' }) : response({ id: 'attachment-1', status: 'completed', result: { decision: 'ACCEPTED' } })
     },
   })
+  assert.equal(client.timeoutMs, 300_000)
   const result = await client.submit({
     runId: 'run-bridge',
     stage: 'reviewer-0',
@@ -47,6 +48,51 @@ test('BridgeClient cancels a timed-out attachment request', async () => {
     runId: 'run-timeout', stage: 'planner', prompt: 'timeout', artifacts: [{ id: 'a', runId: 'run-timeout', stage: 'planner', name: 'a.md', mime: 'text/markdown', bytes: 1, sha256: 'b'.repeat(64), source: 'test', localPath: '/tmp/a.md' }],
   }), /timed out/)
   assert.ok(calls.some(call => call.url.endsWith('/cancel')))
+})
+
+test('BridgeClient distinguishes an upstream cancellation from timeout', async () => {
+  const controller = new AbortController()
+  const calls = []
+  const client = new BridgeClient({
+    baseUrl: 'http://bridge.test',
+    timeoutMs: 5000,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options })
+      if (options.method === 'POST' && url.endsWith('/requests')) return response({ id: 'attachment-cancel', status: 'pending' })
+      if (url.endsWith('/cancel')) return response({ id: 'attachment-cancel', status: 'cancelled' })
+      await new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      })
+    },
+  })
+  const pending = client.submit({
+    runId: 'run-cancel',
+    stage: 'planner',
+    prompt: 'cancel',
+    signal: controller.signal,
+    artifacts: [{ id: 'a', runId: 'run-cancel', stage: 'planner', name: 'a.md', mime: 'text/markdown', bytes: 1, sha256: 'c'.repeat(64), source: 'test', localPath: '/tmp/a.md' }],
+  })
+  setImmediate(() => controller.abort())
+  await assert.rejects(pending, error => error.code === 'CANCELLED' && error.name === 'AbortError')
+  const cancelCall = calls.find(call => call.url.endsWith('/cancel'))
+  assert.ok(cancelCall)
+  assert.match(JSON.parse(cancelCall.options.body).reason, /cancelled/)
+})
+
+test('BridgeClient probe distinguishes timeout and authorization failure', async () => {
+  const timeoutClient = new BridgeClient({
+    baseUrl: 'http://bridge.test',
+    fetchImpl: async (_url, options) => await new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }),
+  })
+  await assert.rejects(timeoutClient.probe({ timeoutMs: 5 }), error => error.code === 'BRIDGE_TIMEOUT')
+
+  const unauthorizedClient = new BridgeClient({
+    baseUrl: 'http://bridge.test',
+    fetchImpl: async () => ({ status: 401 }),
+  })
+  await assert.rejects(unauthorizedClient.probe(), error => error.code === 'BRIDGE_UNAUTHORIZED')
 })
 
 function response(body) {

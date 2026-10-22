@@ -1,5 +1,6 @@
 export const STATES = Object.freeze([
   'IDLE',
+  'CHECKING_ENVIRONMENT',
   'ANALYZING',
   'PLAN_READY',
   'WAITING_FOR_APPROVAL',
@@ -8,6 +9,8 @@ export const STATES = Object.freeze([
   'REVIEWING',
   'COMPLETE',
   'STOPPED',
+  'FAILED',
+  'CANCELLED',
 ])
 
 export const DECISIONS = Object.freeze([
@@ -19,19 +22,22 @@ export const DECISIONS = Object.freeze([
 ])
 
 const TRANSITIONS = Object.freeze({
-  IDLE: new Set(['ANALYZING']),
-  ANALYZING: new Set(['PLAN_READY', 'STOPPED']),
-  PLAN_READY: new Set(['WAITING_FOR_APPROVAL', 'STOPPED']),
-  WAITING_FOR_APPROVAL: new Set(['EXECUTING', 'ANALYZING', 'STOPPED']),
-  EXECUTING: new Set(['COLLECTING_EVIDENCE', 'STOPPED']),
-  COLLECTING_EVIDENCE: new Set(['REVIEWING', 'STOPPED']),
-  REVIEWING: new Set(['COMPLETE', 'EXECUTING', 'ANALYZING', 'WAITING_FOR_APPROVAL', 'STOPPED']),
+  IDLE: new Set(['CHECKING_ENVIRONMENT', 'ANALYZING', 'FAILED', 'CANCELLED']),
+  CHECKING_ENVIRONMENT: new Set(['ANALYZING', 'EXECUTING', 'FAILED', 'CANCELLED']),
+  ANALYZING: new Set(['PLAN_READY', 'STOPPED', 'FAILED', 'CANCELLED']),
+  PLAN_READY: new Set(['WAITING_FOR_APPROVAL', 'EXECUTING', 'STOPPED', 'FAILED', 'CANCELLED']),
+  WAITING_FOR_APPROVAL: new Set(['CHECKING_ENVIRONMENT', 'EXECUTING', 'ANALYZING', 'STOPPED', 'FAILED', 'CANCELLED']),
+  EXECUTING: new Set(['COLLECTING_EVIDENCE', 'STOPPED', 'FAILED', 'CANCELLED']),
+  COLLECTING_EVIDENCE: new Set(['REVIEWING', 'STOPPED', 'FAILED', 'CANCELLED']),
+  REVIEWING: new Set(['COMPLETE', 'EXECUTING', 'ANALYZING', 'WAITING_FOR_APPROVAL', 'STOPPED', 'FAILED', 'CANCELLED']),
   COMPLETE: new Set(),
   STOPPED: new Set(),
+  FAILED: new Set(),
+  CANCELLED: new Set(),
 })
 
 export class RunStateMachine {
-  constructor({ runId, maxFixes = 1 } = {}) {
+  constructor({ runId, maxFixes = 1, initialSnapshot } = {}) {
     if (typeof runId !== 'string' || runId.trim() === '') throw new Error('runId is required')
     if (!Number.isSafeInteger(maxFixes) || maxFixes < 0) throw new Error('maxFixes must be a non-negative safe integer')
     this.runId = runId
@@ -39,6 +45,18 @@ export class RunStateMachine {
     this.state = 'IDLE'
     this.fixCount = 0
     this.audit = []
+    if (initialSnapshot !== undefined) this.restore(initialSnapshot)
+  }
+
+  restore(snapshot) {
+    if (!snapshot || snapshot.runId !== this.runId || !STATES.includes(snapshot.state)) throw new Error('invalid initial state snapshot')
+    if (snapshot.maxFixes !== undefined && snapshot.maxFixes !== this.maxFixes) throw new Error('initial maxFixes does not match controller policy')
+    if (!Number.isSafeInteger(snapshot.fixCount) || snapshot.fixCount < 0 || snapshot.fixCount > this.maxFixes) throw new Error('invalid initial fix count')
+    if (!Array.isArray(snapshot.audit)) throw new Error('invalid initial audit')
+    this.state = snapshot.state
+    this.fixCount = snapshot.fixCount
+    this.audit = snapshot.audit.map(entry => ({ ...entry }))
+    return this
   }
 
   transition(next, metadata = {}) {

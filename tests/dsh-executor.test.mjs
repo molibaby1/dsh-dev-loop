@@ -9,7 +9,7 @@ test('streamCodex pins the installed provider and model route', async () => {
   for await (const chunk of streamCodex(ctx, { messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk)
   assert.equal(chunks[0].text, 'ok')
   assert.equal(seen[0].provider, 'openai-codex')
-  assert.equal(seen[0].model, 'gpt-5.6-luna')
+  assert.equal(seen[0].model, 'gpt-6-luna')
 })
 
 test('DSH Codex executor selects installed route and danger permission', async () => {
@@ -25,11 +25,19 @@ test('DSH Codex executor selects installed route and danger permission', async (
     cancel() {},
   }
   const handle = { agent, async dispose() { calls.push(['dispose']) } }
+  let setupResult
   const ctx = {
     agents: {
       async create(options) {
         calls.push(['create', options])
+        setupResult = await options.setup({})
         return handle
+      },
+    },
+    agentPresets: {
+      async mount(agentCtx) {
+        calls.push(['agent-preset', agentCtx])
+        return { id: 'default' }
       },
     },
     permissionPresets: {
@@ -44,10 +52,12 @@ test('DSH Codex executor selects installed route and danger permission', async (
   const result = await executor.execute({ runId: 'run-executor', cwd: '/repo', task: 'make the change' })
   assert.equal(result.output, 'EXECUTOR_DONE')
   assert.equal(result.provider, 'openai-codex')
-  assert.equal(result.model, 'gpt-5.6-luna')
+  assert.equal(result.model, 'gpt-6-luna')
   assert.equal(calls[0][1].agentOptions.provider, 'openai-codex')
-  assert.equal(calls[0][1].agentOptions.model, 'gpt-5.6-luna')
+  assert.equal(calls[0][1].agentOptions.model, 'gpt-6-luna')
   assert.equal(calls[0][1].meta.cwd, '/repo')
-  assert.equal(calls[1][2], 'danger-full-access')
+  assert.equal(calls[1][0], 'agent-preset')
+  assert.equal(setupResult, undefined)
+  assert.equal(calls[2][2], 'danger-full-access')
   assert.equal(calls.at(-1)[0], 'dispose')
 })

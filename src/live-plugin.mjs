@@ -1,36 +1,32 @@
+/** Cordis plugin name used by loader diagnostics. */
+export const name = 'dev-loop-live'
+
+/** Services accessed while mounting and handling the command. */
+export const inject = ['agents', 'agentPresets', 'commands', 'permissionPresets']
+
 /**
  * Hot-loadable Web-profile entry. Keep the module graph dependency-free at boot;
- * the profile's already-installed package is imported only when a human invokes
- * the command, so config HMR can mount this entry without a process restart.
+ * the installed package is imported only when a human invokes the command.
  */
 export function apply(ctx, config = {}) {
   ctx.inject(['commands'], commandCtx => {
     commandCtx.commands.register({
       name: 'dev-loop',
-      description: 'run the bounded Planner/Executor/Reviewer development loop',
-      input: { hint: '{"problemPackage":{...},"approve":true}', images: false },
-      handler: async ({ rawInput }) => {
+      description: '输入一句需求，先生成方案，确认后再修改和验证',
+      recordInput: true,
+      input: { hint: '例如：修复登录页提交后没有反应的问题', images: false },
+      handler: async invocation => {
         try {
           const modulePath = config.modulePath ?? 'dsh-dev-loop'
           const module = await import(modulePath)
-          const request = module.parseDevLoopInput(rawInput, config)
-          const controller = await module.createDshDevLoopController({ ctx, config: { ...config, ...request } })
-          const result = await controller.run(request)
-          return {
-            kind: result.state === 'COMPLETE' ? 'success' : 'error',
-            text: formatResult(result),
-          }
+          return await module.executeDevLoopCommand({ ctx, config, invocation })
         } catch (error) {
-          return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+          return {
+            kind: 'error',
+            text: `开发流程无法启动\n任务尚未执行。\n建议：检查插件安装和 Web profile 配置。\n\n技术详情：${error instanceof Error ? error.message : String(error)}`,
+          }
         }
       },
     })
   })
 }
-
-function formatResult(result) {
-  const names = Array.isArray(result.artifacts) ? result.artifacts.map(artifact => artifact.name).join(', ') : ''
-  return `dsh-dev-loop ${result.state}; decision=${result.decision ?? 'none'}; runId=${result.runId}; artifacts=${names}`
-}
-
-export default { apply }

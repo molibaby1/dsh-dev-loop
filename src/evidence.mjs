@@ -40,23 +40,24 @@ export function createLocalCommandRunner({ env = process.env } = {}) {
   }
 }
 
-async function git(runCommand, repoRoot, args) {
-  const result = await runCommand({ command: 'git', args, cwd: repoRoot })
+async function git(runCommand, repoRoot, args, signal) {
+  const result = await runCommand({ command: 'git', args, cwd: repoRoot, signal })
   if (result.exitCode !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr.trim()}`)
   return result.stdout
 }
 
-export async function captureGitSnapshot({ repoRoot, runCommand, snapshotRoot, snapshotName = 'snapshot' }) {
+export async function captureGitSnapshot({ repoRoot, runCommand, snapshotRoot, snapshotName = 'snapshot', signal }) {
+  throwIfAborted(signal)
   const [commit, status, diff, diffStat, fileList] = await Promise.all([
-    git(runCommand, repoRoot, ['rev-parse', 'HEAD']),
-    git(runCommand, repoRoot, ['status', '--short', '--branch']),
-    git(runCommand, repoRoot, ['diff', '--binary']),
-    git(runCommand, repoRoot, ['diff', '--stat']),
-    git(runCommand, repoRoot, ['ls-files', '-co', '--exclude-standard', '-z']),
+    git(runCommand, repoRoot, ['rev-parse', 'HEAD'], signal),
+    git(runCommand, repoRoot, ['status', '--short', '--branch'], signal),
+    git(runCommand, repoRoot, ['diff', '--binary'], signal),
+    git(runCommand, repoRoot, ['diff', '--stat'], signal),
+    git(runCommand, repoRoot, ['ls-files', '-co', '--exclude-standard', '-z'], signal),
   ])
   const files = parseNulPaths(fileList)
   const snapshotDir = snapshotRoot ? join(resolve(snapshotRoot), snapshotName) : undefined
-  const fileHashes = snapshotDir ? await copyAndHashFiles(repoRoot, files, snapshotDir) : {}
+  const fileHashes = snapshotDir ? await copyAndHashFiles(repoRoot, files, snapshotDir, signal) : {}
   return {
     commit: commit.trim(),
     status,
@@ -70,7 +71,8 @@ export async function captureGitSnapshot({ repoRoot, runCommand, snapshotRoot, s
   }
 }
 
-export async function diffSnapshots({ baseline, after, runCommand }) {
+export async function diffSnapshots({ baseline, after, runCommand, signal }) {
+  throwIfAborted(signal)
   if (!baseline?.snapshotDir || !after?.snapshotDir) return after?.diff ?? ''
   const paths = [...new Set([...Object.keys(baseline.fileHashes ?? {}), ...Object.keys(after.fileHashes ?? {})])]
     .filter(file => baseline.fileHashes?.[file] !== after.fileHashes?.[file])
@@ -83,6 +85,7 @@ export async function diffSnapshots({ baseline, after, runCommand }) {
       command: 'git',
       args: ['diff', '--no-index', '--binary', '--src-prefix=a/', '--dst-prefix=b/', before, current],
       cwd: baseline.snapshotDir,
+      signal,
     })
     if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error(`git diff --no-index failed for ${file}: ${result.stderr.trim()}`)
     if (result.stdout) chunks.push(normalizePatchPaths(result.stdout, before, current, file))
@@ -95,15 +98,35 @@ export function createEvidenceCollector({ store, runCommand = createLocalCommand
   return {
     runCommand,
     async collect({ runId, round = 0, repoRoot, executorReport, baseline, signal, testCommand: requestedTestCommand }) {
+      throwIfAborted(signal)
       const after = await captureGitSnapshot({
         repoRoot,
         runCommand,
         snapshotRoot: baseline?.snapshotRoot,
         snapshotName: `after-round-${round}`,
+        signal,
       })
-      const delta = await diffSnapshots({ baseline, after, runCommand })
+      const delta = await diffSnapshots({ baseline, after, runCommand, signal })
       const [command, args] = requestedTestCommand ?? testCommand
+      throwIfAborted(signal)
       const test = await runCommand({ command, args, cwd: repoRoot, signal })
+      const changedFileNames = changedFilesBetween(baseline, after)
+      const summary = {
+        round,
+        changedFiles: changedFileNames.length,
+        changedFileNames,
+        deltaBytes: Buffer.byteLength(delta ?? '', 'utf8'),
+        baseline: { commit: baseline?.commit ?? null, dirty: Boolean(baseline?.dirty) },
+        after: { commit: after?.commit ?? null, dirty: Boolean(after?.dirty) },
+        test: {
+          ok: test?.ok === true,
+          exitCode: test?.exitCode ?? null,
+          timedOut: Boolean(test?.timedOut),
+          durationMs: test?.durationMs ?? null,
+          command: [command, ...args],
+        },
+        executor: { stopReason: executorReport?.stopReason ?? null },
+      }
       const suffix = round === 0 ? '' : `-round-${round}`
       const reportText = typeof executorReport === 'string'
         ? executorReport
@@ -135,6 +158,13 @@ export function createEvidenceCollector({ store, runCommand = createLocalCommand
         },
         source: 'test-runner',
       })
+      const summaryArtifact = await store.writeJson({
+        runId,
+        stage: `evidence-${round}`,
+        name: `evidence-summary${suffix}.json`,
+        value: summary,
+        source: 'evidence-summary',
+      })
       const baselineArtifact = await store.writeJson({
         runId,
         stage: `evidence-${round}`,
@@ -154,18 +184,20 @@ export function createEvidenceCollector({ store, runCommand = createLocalCommand
         after,
         delta,
         test,
-        artifacts: [report, diff, testResult, baselineArtifact, afterArtifact],
-        reviewArtifacts: [report, diff, testResult],
+        summary,
+        artifacts: [report, diff, testResult, summaryArtifact, baselineArtifact, afterArtifact],
+        reviewArtifacts: [report, diff, testResult, summaryArtifact],
       }
     },
   }
 }
 
-async function copyAndHashFiles(repoRoot, files, snapshotDir) {
+async function copyAndHashFiles(repoRoot, files, snapshotDir, signal) {
   const root = resolve(repoRoot)
   await mkdir(snapshotDir, { recursive: true, mode: 0o700 })
   const hashes = {}
   for (const file of files) {
+    throwIfAborted(signal)
     if (isAbsolute(file) || file === '..' || file.startsWith(`..${sep}`) || file.includes('\0')) throw new Error(`unsafe repository path: ${file}`)
     const source = resolve(root, file)
     if (!isInside(root, source)) throw new Error(`repository path escapes root: ${file}`)
@@ -205,6 +237,19 @@ function parseNulPaths(value) {
 function isInside(root, candidate) {
   const rel = relative(root, candidate)
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
+function changedFilesBetween(baseline, after) {
+  return [...new Set([...Object.keys(baseline?.fileHashes ?? {}), ...Object.keys(after?.fileHashes ?? {})])]
+    .filter(file => baseline?.fileHashes?.[file] !== after?.fileHashes?.[file])
+    .sort()
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return
+  const error = new Error('evidence collection cancelled')
+  error.name = 'AbortError'
+  throw error
 }
 
 function compactSnapshot(snapshot) {
