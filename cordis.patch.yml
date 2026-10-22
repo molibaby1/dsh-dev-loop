@@ -7,7 +7,7 @@
         modulePath: 'dsh-dev-loop'
         provider: 'openai-codex'
         model: 'gpt-6-luna'
-        permissionPreset: 'danger-full-access'
+        permissionPreset: 'workspace-write'
         autoApprove: false
         projectRoot: !!js process.env.DSH_DEV_LOOP_PROJECT_ROOT
         artifactRoot: !!js process.env.DSH_DEV_LOOP_ARTIFACT_ROOT

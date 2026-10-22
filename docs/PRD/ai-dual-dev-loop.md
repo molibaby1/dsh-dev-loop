@@ -34,6 +34,10 @@ Implement one bounded, evidence-driven run:
 - All evidence collection uses an explicit DSH execution seam or a read-only local adapter with allowlisted commands.
 - Local artifact paths remain inside Controller, Gateway, and Browser Worker protocol; they are never sent to ChatGPT.
 
+## Current Executor permission default
+
+The original PRD's `danger-full-access` permission requirement is historical and is superseded by the DSH 0.2.1-rc.2 compatibility change: Executor defaults to `workspace-write` with DSH's native `approval: ask` policy. Only trusted host/profile configuration can select a higher preset; task text and model output cannot change it. `/dev-loop approve` authorizes the workflow plan and is separate from approval of DSH tool execution.
+
 ## State machine
 
 ```text
@@ -82,7 +86,7 @@ The Controller targets a configured repository root and never resets or cleans i
 - Failed, timed-out, refreshed, and restarted attachment requests have explicit failure or recovery outcomes.
 - Retrying the same request does not create duplicate submission.
 - ChatGPT output is consumed as validated data and never executed directly.
-- The Executor route is `openai-codex` with model `gpt-5.6-luna`; the session permission mapping is `danger-full-access` with no approval prompt.
+- The Executor route is `openai-codex` with model `gpt-5.6-luna`. The original permission mapping (`danger-full-access` with no approval prompt) is a historical requirement superseded by the current Executor permission default above.
 - One `NEEDS_FIX` is allowed; a second automatic fix is rejected and stops the run.
 - Deterministic tests do not require a production ChatGPT account or paid Codex call.
 

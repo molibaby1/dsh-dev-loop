@@ -10,7 +10,7 @@ export async function* streamCodex(ctx, options = {}) {
   })
 }
 
-export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, model = EXECUTOR_MODEL, permissionPreset = 'danger-full-access', sessionIdFactory, messageFactory } = {}) {
+export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, model = EXECUTOR_MODEL, permissionPreset = 'workspace-write', sessionIdFactory, messageFactory } = {}) {
   if (!ctx?.agents) throw new Error('DSH Agent service is required')
   return {
     provider,
@@ -44,10 +44,11 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
       const onAbort = () => {
         if (cancelled) return
         cancelled = true
-        try { agent.cancel({ kind: 'user', message: 'Controller cancelled the Executor run' }) } catch {}
+        agent.cancel({ kind: 'user' })
       }
       if (signal?.aborted) onAbort()
       else signal?.addEventListener('abort', onAbort, { once: true })
+      let disposeSessionEvents
       try {
         if (ctx.permissionPresets?.set) {
           ctx.permissionPresets.set(agent.session, permissionPreset)
@@ -56,6 +57,10 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
         }
         if (cancelled) throw abortExecutorError()
         const firstSeq = agent.session.seq
+        const events = []
+        disposeSessionEvents = ctx.on('session/event', (session, event) => {
+          if (session === agent.session && event.seq >= firstSeq) events.push(event)
+        })
         onProgress?.({ status: 'started', runId })
         agent.followup(makeMessage({
           content: [{ type: 'text', text: task }],
@@ -63,7 +68,8 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
         }))
         await agent.whenIdle()
         if (signal?.aborted || cancelled) throw abortExecutorError()
-        const events = agent.session.events.filter(event => event.seq > firstSeq)
+        disposeSessionEvents()
+        disposeSessionEvents = undefined
         onProgress?.({ status: 'completed', runId })
         return {
           runId,
@@ -74,6 +80,7 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
           events,
         }
       } finally {
+        disposeSessionEvents?.()
         signal?.removeEventListener('abort', onAbort)
         await handle.dispose()
       }
@@ -101,5 +108,5 @@ function lastTurnReason(events) {
 export const DSH_EXECUTOR_DEFAULTS = Object.freeze({
   provider: EXECUTOR_PROVIDER,
   model: EXECUTOR_MODEL,
-  permissionPreset: 'danger-full-access',
+  permissionPreset: 'workspace-write',
 })

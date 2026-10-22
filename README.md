@@ -61,7 +61,11 @@ adapter is the supported way to supply it.
 
 `src/plugin.mjs` can be loaded as a DSH plugin in the **Web profile**. It provides
 `dshDevLoopExecutor` backed by `ctx.agents` and the installed `openai-codex` route. The selected
-permission preset is `danger-full-access`, which sets the session approval policy to `never` for unattended execution.
+permission preset defaults to `workspace-write`, which pairs workspace-scoped writes with DSH's
+native `approval: ask` policy. A higher preset can be selected only through trusted host/profile
+configuration; task text and model output do not select or raise it. This default supersedes the
+historical `danger-full-access` / no-approval requirement in the original PRD. `/dev-loop approve`
+approves the workflow plan only; it does not approve DSH tool requests.
 
 `cordis.patch.yml` is an explicit Web-profile overlay, not an automatic bundle patch. Apply it
 only to the profile that provides `connection` and `web`; attaching the Controller to a minimal

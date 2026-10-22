@@ -12,15 +12,21 @@ test('streamCodex pins the installed provider and model route', async () => {
   assert.equal(seen[0].model, 'gpt-6-luna')
 })
 
-test('DSH Codex executor selects installed route and danger permission', async () => {
+test('DSH Codex executor selects installed route and workspace-write permission', async () => {
   const calls = []
   const events = [
-    { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'EXECUTOR_DONE' }] } } },
-    { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'STALE' }] } } },
+    { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'EXECUTOR_DONE' }] } } },
+    { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } },
   ]
+  const session = { seq: 2 }
+  let onSessionEvent
   const agent = {
-    session: { seq: 0, events },
-    followup(message) { calls.push(['followup', message]) },
+    session,
+    followup(message) {
+      calls.push(['followup', message])
+      for (const event of events) onSessionEvent(session, event)
+    },
     async whenIdle() {},
     cancel() {},
   }
@@ -43,6 +49,14 @@ test('DSH Codex executor selects installed route and danger permission', async (
     permissionPresets: {
       set(session, preset) { calls.push(['permission', session, preset]) },
     },
+    on(name, callback) {
+      assert.equal(name, 'session/event')
+      onSessionEvent = callback
+      return () => {
+        onSessionEvent = undefined
+        calls.push(['listener-dispose'])
+      }
+    },
   }
   const executor = createDshCodexExecutor({
     ctx,
@@ -58,6 +72,31 @@ test('DSH Codex executor selects installed route and danger permission', async (
   assert.equal(calls[0][1].meta.cwd, '/repo')
   assert.equal(calls[1][0], 'agent-preset')
   assert.equal(setupResult, undefined)
-  assert.equal(calls[2][2], 'danger-full-access')
+  assert.equal(calls[2][2], 'workspace-write')
+  assert.deepEqual(result.events, events.slice(1))
+  assert.ok(calls.some(call => call[0] === 'listener-dispose'))
   assert.equal(calls.at(-1)[0], 'dispose')
+})
+
+test('DSH Codex executor propagates Agent failures and disposes its event listener and handle', async () => {
+  const calls = []
+  const agent = {
+    session: { seq: 0 },
+    followup() {},
+    async whenIdle() { throw new Error('agent failed') },
+    cancel() {},
+  }
+  const executor = createDshCodexExecutor({
+    ctx: {
+      agents: { async create() { return { agent, async dispose() { calls.push('handle-dispose') } } } },
+      agentPresets: { async mount() {} },
+      permissionPresets: { set() {} },
+      on(_name, _listener) { return () => calls.push('listener-dispose') },
+    },
+    sessionIdFactory: value => value,
+    messageFactory: value => value,
+  })
+
+  await assert.rejects(executor.execute({ runId: 'run-error', cwd: '/repo', task: 'fail' }), /agent failed/)
+  assert.deepEqual(calls, ['listener-dispose', 'handle-dispose'])
 })

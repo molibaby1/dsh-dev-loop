@@ -17,7 +17,7 @@ export function apply(ctx, config = {}) {
     ...config,
     provider: config.provider ?? 'openai-codex',
     model: config.model ?? 'gpt-6-luna',
-    permissionPreset: config.permissionPreset ?? 'danger-full-access',
+    permissionPreset: config.permissionPreset ?? 'workspace-write',
     autoApprove: config.autoApprove ?? false,
     bridgeBaseUrl: config.bridgeBaseUrl ?? process.env.DSH_BRIDGE_URL ?? 'http://127.0.0.1:7688',
     bridgeToken: config.bridgeToken ?? process.env.DSH_BRIDGE_TOKEN ?? '',

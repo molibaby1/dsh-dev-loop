@@ -41,6 +41,14 @@ test('dev-loop command accepts a natural-language task with configured roots', (
   assert.equal(parsed.approval, false)
 })
 
+test('task JSON cannot select a DSH permission preset', () => {
+  const parsed = parseDevLoopInput(JSON.stringify({
+    problemPackage: { id: 'problem-1' },
+    permissionPreset: 'danger-full-access',
+  }), { projectRoot: '/tmp/project', artifactRoot: '/tmp/dsh-artifacts' })
+  assert.equal(Object.hasOwn(parsed, 'permissionPreset'), false)
+})
+
 test('dev-loop command parses approval and cancellation controls', async () => {
   const { parseDevLoopControl } = await import('../src/command.mjs')
   assert.deepEqual(parseDevLoopControl('approve run-123'), { kind: 'approve', runId: 'run-123' })

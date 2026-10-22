@@ -30,7 +30,7 @@
     {
       "id": "DL-003",
       "title": "Connect DSH Codex subscription execution",
-      "description": "Drive an Executor Agent through the installed dsh-codex-subscription openai-codex route using gpt-5.6-luna and the approved danger-full-access DSH permission preset.",
+      "description": "Historical first-phase route: drive an Executor Agent through the installed dsh-codex-subscription openai-codex route using gpt-5.6-luna and the then-approved danger-full-access preset. The danger-full-access permission requirement is superseded for current runtime defaults by the DSH 0.2.1-rc.2 compatibility change: workspace-write with native approval: ask; only trusted host/profile configuration can select a higher preset.",
       "acceptanceCriteria": [
         "The adapter uses the DSH Agent/LLM runtime rather than a second shell or ChatGPT execution plane.",
         "The executor cwd is the configured product repository.",
