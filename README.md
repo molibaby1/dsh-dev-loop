@@ -93,6 +93,8 @@ dsh plugin --profile web add /absolute/path/to/dsh-dev-loop/client-plugin
 dsh --profile web --patch /absolute/path/to/dsh-dev-loop/cordis.patch.yml
 ```
 
+`dsh-dev-loop-ui` requires DSH `0.2.1-rc.2` or newer: `@deepseek-ai/dsh-client-ui-conversation` provides `uiConversation.events`, `@deepseek-ai/dsh-client-ui-renderer` provides `slots`, and `@deepseek-ai/dsh-client-ui-chat` owns the `conversation.chat.node` card slot.
+
 When the profile already configures the project and artifact roots, the DSH Web composer accepts a
 plain-language task and presents its preflight, progress, evidence, and diagnostic state in Chinese:
 

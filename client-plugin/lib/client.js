@@ -190,15 +190,17 @@ window.__ModuleLoader__.load({
 .dshDevLoopTechnical{margin-top:10px;font-size:12px;color:var(--dsw-alias-label-tertiary)}.dshDevLoopTechnical summary{cursor:pointer}.dshDevLoopTechnical pre{white-space:pre-wrap;overflow:auto;max-height:240px;padding:10px;border-radius:8px;background:var(--dsw-alias-bg-l2);font-size:11px}
 `;
 
-    const inject = ["slots", "conversationEvents"];
+    const inject = ["uiConversation", "slots"];
     function apply(ctx) {
-      if (typeof document !== "undefined" && !document.querySelector('style[data-plugin-css="dsh-dev-loop"]')) {
+      ctx.effect(() => {
+        if (typeof document === "undefined" || document.querySelector('style[data-plugin-css="dsh-dev-loop"]')) return;
         const style = document.createElement("style");
         style.dataset.pluginCss = "dsh-dev-loop";
         style.textContent = css;
         document.head.appendChild(style);
-      }
-      ctx.conversationEvents.register(definition);
+        return () => style.remove();
+      }, "dev-loop-ui: styles");
+      ctx.effect(() => ctx.uiConversation.events.register(definition), "dev-loop-ui: conversation events");
       ctx.slots.inject("conversation.chat.node", () => ctx.slots.register({
         name: "conversation.chat.node",
         key: "dev-loop-card",
