@@ -17,17 +17,19 @@ async function roots() {
 test('preflight reports successful read-only dependency checks', async () => {
   const { projectRoot, artifactRoot } = await roots()
   const calls = []
+  const gitAdapter = async request => {
+    calls.push(request)
+    return { exitCode: 0, stdout: request.operation === 'root' ? `${projectRoot}\n` : '', stderr: '' }
+  }
   const checker = createPreflightChecker({
-    runCommand: async request => {
-      calls.push(request)
-      return { exitCode: 0, stdout: request.command === 'git' ? `${projectRoot}\n` : '', stderr: '' }
-    },
+    gitAdapter,
+    checkZip: async () => ({ exitCode: 0, stderr: '' }),
     bridge: { probe: async () => ({ ok: true, checked: true, status: 404 }) },
     runtime: { agents: true, agentPresets: true, permissionPresets: true },
   })
   const result = await checker({ projectRoot, artifactRoot })
   assert.equal(result.ok, true)
-  assert.deepEqual(calls.map(call => call.command), ['git', 'zip'])
+  assert.deepEqual(calls.map(call => call.operation), ['root'])
   assert.equal(result.bridge.checked, true)
 })
 
@@ -36,7 +38,8 @@ test('preflight rejects an artifact root that is a regular file', async () => {
   const artifactFile = join(artifactRoot, 'not-a-directory')
   await writeFile(artifactFile, 'fixture')
   const checker = createPreflightChecker({
-    runCommand: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    gitAdapter: async () => ({ exitCode: 0, stdout: `${projectRoot}\n`, stderr: '' }),
+    checkZip: async () => ({ exitCode: 0, stderr: '' }),
   })
   await assert.rejects(checker({ projectRoot, artifactRoot: artifactFile }), error => error.code === 'ARTIFACT_ROOT_INVALID')
 })
@@ -44,7 +47,8 @@ test('preflight rejects an artifact root that is a regular file', async () => {
 test('preflight fails before execution when runtime services are missing', async () => {
   const { projectRoot, artifactRoot } = await roots()
   const checker = createPreflightChecker({
-    runCommand: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    gitAdapter: async () => ({ exitCode: 0, stdout: `${projectRoot}\n`, stderr: '' }),
+    checkZip: async () => ({ exitCode: 0, stderr: '' }),
     runtime: { agents: true, agentPresets: false, permissionPresets: true },
   })
   await assert.rejects(checker({ projectRoot, artifactRoot }), error => error.code === 'DSH_RUNTIME_MISSING')

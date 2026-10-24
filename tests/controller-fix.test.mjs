@@ -13,7 +13,14 @@ test('controller performs at most one automatic NEEDS_FIX round', async () => {
   await mkdir(project, { recursive: true })
   await writeFile(join(project, 'fixture.txt'), 'fix')
   const store = await new ArtifactStore({ root: join(root, 'runs'), maxArtifactBytes: 1024 * 1024, maxZipBytes: 1024 * 1024 }).init()
+  const gitAdapter = async ({ operation, repoRoot }) => ({
+    exitCode: 0,
+    stdout: operation === 'root' ? `${repoRoot}\n` : operation === 'head' ? 'fixture\n' : '',
+    stderr: '',
+  })
   const evidenceCollector = {
+    projectRoot: project,
+    gitAdapter,
     runCommand: async ({ command, args }) => ({ command, args, exitCode: 0, signal: null, stdout: command === 'git' && args[0] === 'rev-parse' ? 'fixture\n' : '', stderr: '', durationMs: 1, ok: true }),
     async collect({ runId, round }) {
       return { artifacts: [

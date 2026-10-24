@@ -6,17 +6,22 @@ import { DevLoopError, diagnosticFromError, isAbortError } from './diagnostics.m
 import { captureGitSnapshot } from './evidence.mjs'
 import { createPreflightChecker } from './preflight.mjs'
 import { DEV_LOOP_FINGERPRINT, publicProgressEvent } from './presentation.mjs'
+import { assertConfiguredProjectRoot } from './project-root.mjs'
+import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 
 export class DevLoopController {
-  constructor({ store, bridge, executor, evidenceCollector, preflight, maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
+  constructor({ store, bridge, executor, evidenceCollector, gitAdapter, preflight, projectRoot, maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
     if (!store || !bridge || !executor || !evidenceCollector) throw new Error('store, bridge, executor, and evidenceCollector are required')
-    if (typeof evidenceCollector.runCommand !== 'function') throw new Error('evidenceCollector.runCommand is required')
+    this.gitAdapter = gitAdapter ?? evidenceCollector.gitAdapter
+    if (typeof this.gitAdapter !== 'function') throw new Error('fixed Git evidence adapter is required')
+    this.projectRoot = assertConfiguredProjectRoot(projectRoot ?? evidenceCollector.projectRoot)
+    this.artifactRoot = store.root ?? store.configuredRoot
     if (maxFixes !== 1) throw new Error('phase one requires exactly one automatic NEEDS_FIX budget')
     this.store = store
     this.bridge = bridge
     this.executor = executor
     this.evidenceCollector = evidenceCollector
-    this.preflight = preflight ?? createPreflightChecker({ runCommand: evidenceCollector.runCommand, bridge })
+    this.preflight = preflight ?? createPreflightChecker({ gitAdapter: this.gitAdapter, bridge })
     this.maxFixes = maxFixes
     this.runIdFactory = runIdFactory
   }
@@ -42,7 +47,10 @@ export class DevLoopController {
       executorTask ??= resumeData.request.executorTask
       testCommand ??= resumeData.request.testCommand
     }
-    if (typeof projectRoot !== 'string' || projectRoot.length === 0) throw new Error('projectRoot is required')
+    if (artifactRoot !== undefined || this.artifactRoot !== undefined) {
+      artifactRoot = assertConfiguredArtifactRoot(this.artifactRoot, artifactRoot)
+    }
+    projectRoot = assertConfiguredProjectRoot(this.projectRoot, projectRoot)
     if (!problemPackage || typeof problemPackage !== 'object' || Array.isArray(problemPackage)) throw new Error('problemPackage is required')
     const machine = new RunStateMachine({ runId, maxFixes: this.maxFixes, initialSnapshot: resumeData?.state })
     let runRoot
@@ -157,7 +165,8 @@ export class DevLoopController {
         await transition('ANALYZING')
         baseline = await captureGitSnapshot({
           repoRoot: projectRoot,
-          runCommand: this.evidenceCollector.runCommand,
+          gitAdapter: this.gitAdapter,
+          artifactRoot: this.store.root,
           snapshotRoot,
           snapshotName: 'baseline',
           signal,

@@ -4,10 +4,10 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import AgentPresets from '@deepseek-ai/dsh-agent-preset-registry'
 import Commands from '@deepseek-ai/dsh-commands'
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { HarnessError, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import PermissionPresets from '@deepseek-ai/dsh-permission-presets'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { createDshCodexExecutor } from '../src/dsh-executor.mjs'
@@ -22,7 +22,7 @@ class MockAdapter extends LlmAdapter {
     super()
     this.failure = failure
     this.hang = hang
-    this.toolCall = toolCall
+    this.toolCalls = toolCall ? [toolCall] : []
     this.started = new Promise(resolve => { this.markStarted = resolve })
   }
 
@@ -37,12 +37,14 @@ class MockAdapter extends LlmAdapter {
       })
       throw new Error('mock stream interrupted')
     }
-    if (this.toolCall && this.calls === 1) {
-      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
-      yield { type: 'block-end', index: 0, block: {
-        type: 'tool-call', id: this.toolCall.id, name: this.toolCall.name,
-        arguments: JSON.stringify(this.toolCall.arguments),
-      } }
+    if (this.toolCalls.length > 0 && this.calls === 1) {
+      for (const [index, call] of this.toolCalls.entries()) {
+        yield { type: 'block-start', index, blockType: 'tool-call' }
+        yield { type: 'block-end', index, block: {
+          type: 'tool-call', id: call.id, name: call.name,
+          arguments: JSON.stringify(call.arguments),
+        } }
+      }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
     }
@@ -55,7 +57,28 @@ class MockAdapter extends LlmAdapter {
   }
 }
 
-async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(), pluginConfig = {} } = {}) {
+function registerFakeBash(ctx, execute) {
+  ctx.tools.register(defineTool({
+    name: 'bash',
+    description: 'Run one verification command',
+    parameters: {
+      description: { type: 'string', required: true },
+      command: { type: 'string', required: true },
+      workdir: { type: 'string', required: true },
+      timeoutMs: { type: 'number' },
+      run_in_background: { type: 'boolean' },
+      sandbox_permissions: { type: 'string' },
+      justification: { type: 'string' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    execute,
+  }))
+}
+
+async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(), pluginConfig = {}, testApprovalOutcome } = {}) {
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   ctx.baseUrl = new URL('./', import.meta.url).href
@@ -63,6 +86,7 @@ async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(
   await mountAgentLoopTestDependencies(ctx)
   ctx.provide('shell', { sandboxMode: 'workspace-write' })
   await ctx.plugin(ApprovalService, { policy: 'ask' })
+  if (testApprovalOutcome) ctx.on('approval/request', () => testApprovalOutcome)
   await ctx.plugin(PermissionPresets)
   await ctx.plugin(Commands)
   await ctx.plugin(AgentPresets, { default: 'standard' })
@@ -227,6 +251,237 @@ test('workspace-write waits for native tool approval and rejection prevents exec
   assert.ok(result.events.some(event => event.type === 'tool/result'
     && event.data.message.content.some(block => block.type === 'text'
       && block.text.includes('the user rejected tool "approval-probe"'))))
+})
+
+test('test execution uses one scoped DSH bash result and waits for native approval', async t => {
+  const command = "'npm' 'run' 'verify:quick'"
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'test-command-call',
+    name: 'bash',
+    arguments: { description: 'Run the quick verification suite', command, workdir: '/tmp' },
+  } })
+  const { ctx } = await createWebComposition(t, plugin, { adapter })
+  let executions = 0
+  registerFakeBash(ctx, async args => {
+    executions += 1
+    return {
+      kind: 'foreground', cwd: args.workdir, exitCode: 0, signal: null,
+      timedOut: false, aborted: false, timeoutMs: 30_000,
+      stdout: { text: 'PASS', truncated: false },
+      stderr: { text: '', truncated: false },
+      sandbox: { mode: 'workspace-write', denied: false, enforcement: 'full' },
+    }
+  })
+  let approvalRequest
+  ctx.on('approval/request', request => {
+    approvalRequest = request
+    return 'allowed-once'
+  })
+
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-approval', round: 3, cwd: '/tmp', command: 'npm', args: ['run', 'verify:quick'],
+  })
+  assert.ok(approvalRequest, 'the exact test bash call must request native DSH approval')
+  assert.equal(approvalRequest.toolName, 'bash')
+  assert.equal(approvalRequest.reason, "Host-authorized test command requires one-time approval for run test-evidence-approval, round 3: 'npm' 'run' 'verify:quick'")
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(result.source, 'dsh-tool-result')
+  assert.equal(result.requestId, 'test-evidence-approval:round-3:test')
+  assert.equal(result.authorizedCallId, 'test-command-call')
+  assert.equal(result.commandResult.exitCode, 0)
+  assert.deepEqual(result.approvalEvents.map(event => event.type), ['approval/asked', 'approval/decided'])
+  assert.equal(result.approvalEvents[0].data.callId, 'test-command-call')
+  assert.equal(result.approvalEvents[1].data.outcome, 'allowed-once')
+  assert.equal(executions, 1)
+})
+
+test('test execution refuses a trusted full-access preset before requesting model or tool work', async t => {
+  const adapter = new MockAdapter()
+  const { ctx } = await createWebComposition(t, plugin, {
+    adapter,
+    pluginConfig: { permissionPreset: 'danger-full-access' },
+  })
+  let executions = 0
+  registerFakeBash(ctx, async () => {
+    executions += 1
+    return { kind: 'foreground', exitCode: 0, sandbox: { mode: 'danger-full-access' } }
+  })
+
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-full-access-preset', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_SANDBOX_UNAVAILABLE')
+  assert.match(result.failureReason, /workspace-write sandbox/)
+  assert.equal(adapter.calls, 0)
+  assert.equal(executions, 0)
+  assert.equal(result.attempts.length, 0)
+  assert.equal(ctx.agents.roots().length, 0)
+})
+
+test('test execution rejection by native approval never becomes passing evidence', async t => {
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'rejected-test-command', name: 'bash',
+    arguments: { description: 'Run the requested verification', command: "'npm' 'test'", workdir: '/tmp' },
+  } })
+  const { ctx } = await createWebComposition(t, plugin, { adapter })
+  let executions = 0
+  registerFakeBash(ctx, async () => { executions += 1; throw new Error('approval rejection must prevent execution') })
+  let approvalRequest
+  ctx.on('approval/request', request => {
+    approvalRequest = request
+    return 'rejected'
+  })
+
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-rejected', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+
+  assert.ok(approvalRequest, 'the test bash call must use the native DSH approval channel')
+  assert.equal(approvalRequest.toolName, 'bash')
+  assert.equal(approvalRequest.reason, "Host-authorized test command requires one-time approval for run test-evidence-rejected, round 0: 'npm' 'test'")
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_TOOL_REJECTED_OR_FAILED')
+  assert.equal(result.exitCode, null)
+  assert.equal(result.approvalEvents[1].data.outcome, 'rejected')
+  assert.equal(executions, 0)
+})
+
+test('test execution fails closed when the DSH approval channel is unavailable', async t => {
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'unavailable-test-command', name: 'bash',
+    arguments: { description: 'Run the requested verification', command: "'npm' 'test'", workdir: '/tmp' },
+  } })
+  const { ctx } = await createWebComposition(t, plugin, { adapter })
+  let executions = 0
+  registerFakeBash(ctx, async () => {
+    executions += 1
+    return { kind: 'foreground', exitCode: 0 }
+  })
+
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-no-approval-channel', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_TOOL_REJECTED_OR_FAILED')
+  assert.equal(result.approvalEvents.at(-1).data.outcome, 'unavailable')
+  assert.equal(executions, 0)
+})
+
+test('test execution maps a DSH tool abort error to cancelled evidence', async t => {
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'cancelled-test-command', name: 'bash',
+    arguments: { description: 'Run the requested verification', command: "'npm' 'test'", workdir: '/tmp' },
+  } })
+  const { ctx } = await createWebComposition(t, plugin, { adapter, testApprovalOutcome: 'allowed-once' })
+  registerFakeBash(ctx, async () => {
+    throw new HarnessError('tool call aborted', TOOL_ABORTED)
+  })
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-tool-abort', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_COMMAND_CANCELLED')
+  assert.equal(result.aborted, true)
+  assert.equal(result.exitCode, null)
+})
+
+test('cancelling a test Agent turn records failure without dispatching a host command', async t => {
+  const adapter = new MockAdapter({ hang: true })
+  const { ctx } = await createWebComposition(t, plugin, { adapter })
+  const controller = new AbortController()
+  const running = ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-agent-cancel', round: 0, cwd: '/tmp', command: 'npm', args: ['test'], signal: controller.signal,
+  })
+  await adapter.started
+  controller.abort()
+  const result = await running
+
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_COMMAND_CANCELLED')
+  assert.equal(result.aborted, true)
+  assert.equal(result.attempts.length, 0)
+  assert.equal(result.exitCode, null)
+})
+
+test('test execution rejects timeout, cancellation, denied, and unavailable sandbox results', async t => {
+  const scenarios = [
+    ['tool timeout', { kind: 'foreground', exitCode: 124, timedOut: true, aborted: false, sandbox: { mode: 'workspace-write', denied: false } }, 'TEST_COMMAND_TIMED_OUT'],
+    ['tool cancellation', { kind: 'foreground', exitCode: null, signal: 'SIGTERM', timedOut: false, aborted: true, sandbox: { mode: 'workspace-write', denied: false } }, 'TEST_COMMAND_CANCELLED'],
+    ['sandbox denial', { kind: 'foreground', exitCode: 0, timedOut: false, aborted: false, sandbox: { mode: 'workspace-write', denied: true } }, 'TEST_SANDBOX_DENIED'],
+    ['sandbox runner failure', { kind: 'foreground', exitCode: 0, timedOut: false, aborted: false, sandbox: { mode: 'workspace-write', denied: false, runnerFailed: true } }, 'TEST_SANDBOX_UNAVAILABLE'],
+    ['full-access tool result', { kind: 'foreground', exitCode: 0, timedOut: false, aborted: false, sandbox: { mode: 'danger-full-access', denied: false } }, 'TEST_SANDBOX_UNAVAILABLE'],
+    ['missing sandbox facts', { kind: 'foreground', exitCode: 0, timedOut: false, aborted: false }, 'TEST_SANDBOX_UNAVAILABLE'],
+  ]
+  for (const [name, value, errorCode] of scenarios) {
+    await t.test(name, async subtest => {
+      const adapter = new MockAdapter({ toolCall: {
+        id: `test-${name.replaceAll(' ', '-')}`, name: 'bash',
+        arguments: { description: 'Run the requested verification', command: "'npm' 'test'", workdir: '/tmp' },
+      } })
+      const { ctx } = await createWebComposition(subtest, plugin, { adapter, testApprovalOutcome: 'allowed-once' })
+      registerFakeBash(ctx, async () => value)
+      const result = await ctx.dshDevLoopExecutor.executeTest({
+        runId: `test-evidence-${name.replaceAll(' ', '-')}`, round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+      })
+      assert.equal(result.ok, false)
+      assert.equal(result.errorCode, errorCode)
+      if (errorCode === 'TEST_COMMAND_CANCELLED') assert.equal(result.aborted, true)
+    })
+  }
+})
+
+test('test execution cannot pass from assistant text without a tool result', async t => {
+  const { ctx } = await createWebComposition(t, plugin)
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-no-tool', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_TOOL_NOT_CALLED')
+  assert.equal(result.toolResults.length, 0)
+  assert.match(result.assistantOutput, /EXECUTOR_DONE/)
+})
+
+test('test execution rejects a mismatched command before the DSH tool body', async t => {
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'wrong-test-command-call', name: 'bash',
+    arguments: { description: 'Run tests', command: "'npm' 'run' 'other'", workdir: '/tmp' },
+  } })
+  const { ctx } = await createWebComposition(t, plugin, { adapter })
+  let executions = 0
+  registerFakeBash(ctx, async () => { executions += 1; return { kind: 'foreground', exitCode: 0 } })
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-mismatch', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_TOOL_CALL_MISMATCH')
+  assert.equal(result.toolResults.length, 1)
+  assert.equal(result.toolResults[0].isError, true)
+  assert.equal(executions, 0)
+})
+
+test('test execution does not merge multiple DSH tool calls into one result', async t => {
+  const adapter = new MockAdapter()
+  adapter.toolCalls = [
+    { id: 'first-test-call', name: 'bash', arguments: { description: 'Run tests', command: "'npm' 'test'", workdir: '/tmp' } },
+    { id: 'second-test-call', name: 'bash', arguments: { description: 'Run something else', command: "'npm' 'run' 'other'", workdir: '/tmp' } },
+  ]
+  const { ctx } = await createWebComposition(t, plugin, { adapter, testApprovalOutcome: 'allowed-once' })
+  let executions = 0
+  registerFakeBash(ctx, async () => {
+    executions += 1
+    return { kind: 'foreground', cwd: '/tmp', exitCode: 0, timedOut: false, aborted: false, stdout: { text: '', truncated: false }, stderr: { text: '', truncated: false } }
+  })
+  const result = await ctx.dshDevLoopExecutor.executeTest({
+    runId: 'test-evidence-multiple', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.errorCode, 'TEST_MULTIPLE_TOOL_CALLS')
+  assert.equal(result.attempts.length, 2)
+  assert.equal(executions, 1)
 })
 
 test('cancellation interrupts the mock Agent and disposes its resources', async t => {

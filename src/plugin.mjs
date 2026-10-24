@@ -1,6 +1,8 @@
 import { createDshDevLoopController } from './host.mjs'
 import { createDshCodexExecutor } from './dsh-executor.mjs'
 import { createDevLoopCommand } from './command.mjs'
+import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
+import { assertConfiguredProjectRoot } from './project-root.mjs'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dev-loop'
@@ -28,7 +30,11 @@ export function apply(ctx, config = {}) {
   const executor = createDshCodexExecutor({ ...effectiveConfig, ctx })
   ctx.provide('dshDevLoopExecutor', executor)
   ctx.provide('dshDevLoopController', {
-    create: controllerConfig => createDshDevLoopController({ ctx, config: { ...effectiveConfig, ...controllerConfig } }),
+    create: async controllerConfig => {
+      const projectRoot = assertConfiguredProjectRoot(effectiveConfig.projectRoot, controllerConfig?.projectRoot)
+      const artifactRoot = assertConfiguredArtifactRoot(effectiveConfig.artifactRoot, controllerConfig?.artifactRoot)
+      return createDshDevLoopController({ ctx, config: { ...effectiveConfig, ...controllerConfig, projectRoot, artifactRoot } })
+    },
   })
   ctx.inject(['commands'], commandCtx => {
     commandCtx.commands.register(createDevLoopCommand({ ctx, config: effectiveConfig }))

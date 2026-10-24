@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -13,7 +13,14 @@ async function fixture() {
   await mkdir(project, { recursive: true })
   await writeFile(join(project, 'fixture.txt'), 'PLANNER_UNIQUE_MARKER')
   const store = await new ArtifactStore({ root: join(root, 'runs'), maxArtifactBytes: 1024 * 1024, maxZipBytes: 1024 * 1024 }).init()
+  const gitAdapter = async ({ operation, repoRoot }) => ({
+    exitCode: 0,
+    stdout: operation === 'root' ? `${repoRoot}\n` : operation === 'head' ? 'fixture-commit\n' : '',
+    stderr: '',
+  })
   const evidenceCollector = {
+    projectRoot: project,
+    gitAdapter,
     runCommand: async ({ command, args }) => ({ command, args, exitCode: 0, signal: null, stdout: command === 'git' && args[0] === 'rev-parse' ? 'fixture-commit\n' : '', stderr: '', durationMs: 1, ok: true }),
     async collect({ store: ignored, runId }) {
       return {
@@ -33,7 +40,7 @@ test('controller returns a structured bootstrap diagnostic when run storage cann
     store: { async runRoot() { throw new Error('storage offline') } },
     bridge: createFakeBridge({}),
     executor: { execute: async () => ({}) },
-    evidenceCollector: { runCommand: async () => ({ exitCode: 0 }), collect: async () => ({ artifacts: [] }) },
+    evidenceCollector: { projectRoot: '/tmp/project', gitAdapter: async () => ({ exitCode: 0, stdout: '/tmp/project\n', stderr: '' }), collect: async () => ({ artifacts: [] }) },
     runIdFactory: () => 'run-storage-failure',
   })
   const result = await controller.run({ projectRoot: '/tmp/project', problemPackage: { id: 'problem-1' } })
@@ -41,6 +48,82 @@ test('controller returns a structured bootstrap diagnostic when run storage cann
   assert.equal(result.diagnostic.code, 'ARTIFACT_ROOT_INVALID')
   assert.equal(result.summary.hasModifiedProject, false)
   assert.deepEqual(result.artifacts, [])
+
+  await assert.rejects(controller.run({
+    projectRoot: '/tmp/project',
+    artifactRoot: '/tmp/untrusted-artifacts',
+    problemPackage: { id: 'problem-1' },
+  }), /configured artifactRoot/)
+})
+
+test('controller rejects a request to run against an unconfigured repository', async () => {
+  const { root, project, store, evidenceCollector } = await fixture()
+  const alternate = join(root, 'alternate-project')
+  await mkdir(alternate)
+  const bridge = createFakeBridge({})
+  let executed = false
+  const controller = new DevLoopController({
+    store,
+    bridge,
+    evidenceCollector,
+    projectRoot: project,
+    executor: { execute: async () => { executed = true; return {} } },
+  })
+
+  await assert.rejects(controller.run({
+    projectRoot: alternate,
+    problemPackage: { id: 'problem-1' },
+  }), /projectRoot must match configured projectRoot/)
+  assert.equal(bridge.calls.length, 0)
+  assert.equal(executed, false)
+})
+
+test('controller rejects an artifact-root override before preflight or Bridge calls', async () => {
+  const { root, project, store, evidenceCollector } = await fixture()
+  const alternate = join(root, 'alternate-artifacts')
+  await mkdir(alternate)
+  let preflightCalled = false
+  const bridge = createFakeBridge({})
+  const controller = new DevLoopController({
+    store,
+    bridge,
+    evidenceCollector,
+    projectRoot: project,
+    preflight: async () => { preflightCalled = true; return { ok: true } },
+    executor: { execute: async () => ({}) },
+  })
+
+  await assert.rejects(controller.run({
+    projectRoot: project,
+    artifactRoot: alternate,
+    problemPackage: { id: 'problem-1' },
+  }), /configured artifactRoot/)
+  assert.equal(preflightCalled, false)
+  assert.equal(bridge.calls.length, 0)
+})
+
+test('controller accepts an artifact-root alias only when it resolves to the configured store root', async () => {
+  const { root, project, store, evidenceCollector } = await fixture()
+  const alias = join(root, 'artifact-root-alias')
+  await symlink(store.root, alias)
+  const preflightRoots = []
+  const controller = new DevLoopController({
+    store,
+    bridge: createFakeBridge({ planner: { executorTask: 'bounded task' } }),
+    evidenceCollector,
+    projectRoot: project,
+    preflight: async ({ artifactRoot }) => { preflightRoots.push(artifactRoot); return { ok: true } },
+    executor: { execute: async () => ({}) },
+  })
+
+  const result = await controller.run({
+    projectRoot: project,
+    artifactRoot: alias,
+    problemPackage: { id: 'problem-1' },
+  })
+
+  assert.equal(result.state, 'WAITING_FOR_APPROVAL')
+  assert.deepEqual(preflightRoots, [store.root])
 })
 
 test('controller waits for explicit approval and does not execute', async () => {
@@ -105,6 +188,36 @@ test('controller rejects a changed persisted plan before approval', async () => 
   const waiting = await controller.run({ projectRoot: project, problemPackage: { id: 'problem-1' } })
   await writeFile(join(root, 'runs', waiting.runId, 'plan.json'), '{"executorTask":"tampered"}\n')
   await assert.rejects(() => controller.resumeApproved({ runId: waiting.runId }), /artifact hash changed/)
+})
+
+test('controller rejects a persisted request that changes the trusted artifact root on resume', async () => {
+  const { root, project, store, evidenceCollector } = await fixture()
+  const alternate = join(root, 'alternate-artifacts')
+  await mkdir(alternate)
+  const bridge = createFakeBridge({ planner: { executorTask: 'persisted task' } })
+  const first = new DevLoopController({
+    store,
+    bridge,
+    evidenceCollector,
+    projectRoot: project,
+    executor: { execute: async () => ({}) },
+    runIdFactory: () => 'run-tampered-artifact-root',
+  })
+  const waiting = await first.run({ projectRoot: project, problemPackage: { id: 'problem-1' } })
+  const request = await store.readJson({ runId: waiting.runId, name: 'run-request.json' })
+  request.artifactRoot = alternate
+  await store.writeJson({ runId: waiting.runId, stage: 'request', name: 'run-request.json', value: request, source: 'human' })
+  let executed = false
+  const resumed = new DevLoopController({
+    store,
+    bridge,
+    evidenceCollector,
+    projectRoot: project,
+    executor: { execute: async () => { executed = true; return { output: 'done', stopReason: { kind: 'completed' } } } },
+  })
+
+  await assert.rejects(() => resumed.resumeApproved({ runId: waiting.runId }), /configured artifactRoot/)
+  assert.equal(executed, false)
 })
 
 test('controller cancels a persisted waiting run without executing', async () => {
@@ -359,7 +472,7 @@ test('controller completes Planner -> Executor -> Reviewer with ordered evidence
   assert.equal(result.decision, 'ACCEPTED')
   const reviewerCall = bridge.calls.find(request => request.stage === 'reviewer-0')
   assert.ok(reviewerCall.idempotencyKey.length <= 256)
-  assert.equal(executorCalls[0].cwd, project)
+  assert.equal(executorCalls[0].cwd, await realpath(project))
   assert.equal(executorCalls[0].task, 'TASK')
   assert.ok(result.artifacts.some(artifact => artifact.name === 'run-manifest.json'))
   assert.ok(result.artifacts.some(artifact => artifact.name === 'audit-trace.json'))

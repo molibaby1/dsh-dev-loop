@@ -12,7 +12,14 @@ async function makeController(responses) {
   await mkdir(project, { recursive: true })
   await writeFile(join(project, 'fixture.txt'), 'fixture')
   const store = await new ArtifactStore({ root: join(root, 'runs'), maxArtifactBytes: 1024 * 1024, maxZipBytes: 1024 * 1024 }).init()
+  const gitAdapter = async ({ operation, repoRoot }) => ({
+    exitCode: 0,
+    stdout: operation === 'root' ? `${repoRoot}\n` : operation === 'head' ? 'commit\n' : '',
+    stderr: '',
+  })
   const evidenceCollector = {
+    projectRoot: project,
+    gitAdapter,
     runCommand: async ({ command, args }) => ({ command, args, exitCode: 0, signal: null, stdout: command === 'git' && args[0] === 'rev-parse' ? 'commit\n' : '', stderr: '', durationMs: 1, ok: true }),
     async collect({ runId }) {
       return { artifacts: [

@@ -54,8 +54,10 @@ node bin/dsh-dev-loop.mjs run \
   --approve
 ```
 
-The host executor module must export `createExecutor()` or `execute()`. The DSH plugin host
-adapter is the supported way to supply it.
+The host executor module must export `createExecutor()` or `execute()` for Agent turns and also
+provide `executeTest()` backed by the DSH Agent tool path. The CLI rejects modules without that
+DSH test executor; it has no local test-command fallback. The DSH plugin host adapter is the
+supported way to supply both methods.
 
 ## DSH host adapter
 

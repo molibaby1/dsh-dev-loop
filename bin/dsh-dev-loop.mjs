@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url'
 import { ArtifactStore, createProjectZip, exposeArtifact } from '../src/artifacts.mjs'
 import { BridgeClient } from '../src/bridge-client.mjs'
 import { DevLoopController } from '../src/controller.mjs'
-import { createEvidenceCollector } from '../src/evidence.mjs'
+import { createEvidenceCollector, createGitEvidenceAdapter } from '../src/evidence.mjs'
 
 const [command, ...args] = process.argv.slice(2)
 
@@ -36,23 +36,33 @@ async function runCommand(values) {
   if (!projectRoot || !artifactRoot) fail('run requires --project and --output')
   if (!executorModule) fail('run requires --executor-module; standalone subscription APIs are intentionally unsupported')
   const store = await new ArtifactStore({ root: artifactRoot }).init()
-  const executor = await loadExecutor(executorModule, { projectRoot, artifactRoot })
+  const gitAdapter = createGitEvidenceAdapter({ projectRoot: resolve(projectRoot), artifactRoot: store.root })
+  const trustedProjectRoot = gitAdapter.projectRoot
+  const executor = await loadExecutor(executorModule, { projectRoot: trustedProjectRoot, artifactRoot: store.root })
+  if (typeof executor.executeTest !== 'function') fail('executor module must provide executeTest() wired to DSH Agent tools; local test runners are unsupported')
   const bridge = new BridgeClient({
     baseUrl: option(values, '--bridge-url') ?? process.env.DSH_BRIDGE_URL ?? 'http://127.0.0.1:7688',
     token: option(values, '--bridge-token') ?? process.env.DSH_BRIDGE_TOKEN ?? '',
     timeoutMs: Number(option(values, '--bridge-timeout-ms') ?? 300_000),
   })
   const testCommand = parseTestCommand(option(values, '--test-command'))
-  const evidenceCollector = createEvidenceCollector({ store, testCommand })
+  const evidenceCollector = createEvidenceCollector({
+    store,
+    gitAdapter,
+    testExecutor: request => executor.executeTest(request),
+    testCommand,
+  })
   const controller = new DevLoopController({
     store,
     bridge,
     executor,
     evidenceCollector,
+    gitAdapter,
+    projectRoot: trustedProjectRoot,
     runIdFactory: () => option(values, '--run-id') ?? `run-${Date.now()}`,
   })
   const result = await controller.run({
-    projectRoot,
+    projectRoot: trustedProjectRoot,
     problemPackage,
     approval: values.includes('--approve'),
     executorTask: option(values, '--task'),
@@ -68,8 +78,8 @@ async function loadExecutor(modulePath, options) {
   const module = await import(url)
   if (typeof module.createExecutor === 'function') return module.createExecutor(options)
   if (typeof module.default?.createExecutor === 'function') return module.default.createExecutor(options)
-  if (typeof module.execute === 'function') return { execute: module.execute }
-  if (typeof module.default?.execute === 'function') return { execute: module.default.execute }
+  if (typeof module.execute === 'function') return { execute: module.execute, executeTest: module.executeTest }
+  if (typeof module.default?.execute === 'function') return { execute: module.default.execute, executeTest: module.default.executeTest }
   throw new Error('executor module must export createExecutor() or execute()')
 }
 

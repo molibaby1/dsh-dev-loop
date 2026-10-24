@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { accessSync, constants as fsConstants, lstatSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, readdir, realpath, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 
 const DEFAULT_EXCLUDED_DIRS = new Set([
   '.git',
@@ -251,9 +252,63 @@ export async function createProjectZip(store, { runId, projectRoot, stage = 'pla
   return { artifact: await finalizeArtifact(descriptor), files }
 }
 
+/** Resolve the host-installed ZIP executable once per invocation without a shell. */
+export function resolveZipExecutable() {
+  const candidates = String(process.env.PATH ?? '').split(delimiter).filter(Boolean).map(directory => join(directory, 'zip'))
+  for (const candidate of candidates) {
+    try {
+      const path = realpathSync(resolve(candidate))
+      const info = lstatSync(path)
+      if (!info.isFile() || info.isSymbolicLink()) continue
+      accessSync(path, process.platform === 'win32' ? fsConstants.F_OK : fsConstants.X_OK)
+      return path
+    } catch {}
+  }
+  throw new Error('zip command unavailable: executable not found in the host PATH')
+}
+
+/** Probe the fixed ZIP executable with its fixed version argument. */
+export function checkZipAvailable({ signal } = {}) {
+  if (signal?.aborted) return Promise.reject(abortError('zip preflight cancelled'))
+  const executable = resolveZipExecutable()
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(executable, ['-v'], {
+      env: zipEnvironment(),
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+    })
+    let stderr = ''
+    let timedOut = false
+    let aborted = false
+    const stop = cause => {
+      if (timedOut || aborted) return
+      timedOut = cause === 'timeout'
+      aborted = cause === 'aborted'
+      child.kill('SIGTERM')
+    }
+    const timer = setTimeout(() => stop('timeout'), 5_000)
+    const onAbort = () => stop('aborted')
+    signal?.addEventListener('abort', onAbort, { once: true })
+    child.stderr.on('data', chunk => {
+      if (Buffer.byteLength(stderr) < 8_192) stderr += Buffer.from(chunk).subarray(0, 8_192 - Buffer.byteLength(stderr)).toString('utf8')
+    })
+    child.once('error', error => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      reject(new Error(`zip command unavailable: ${error.message}`, { cause: error }))
+    })
+    child.once('close', (exitCode, signalName) => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolvePromise({ exitCode, signal: signalName, stderr, timedOut, aborted, ok: exitCode === 0 && !timedOut && !aborted })
+    })
+  })
+}
+
 function zipFiles(cwd, output, files) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn('zip', ['-q', '-X', '-@', output], {
+    const child = spawn(resolveZipExecutable(), ['-q', '-X', '-@', output], {
+      env: zipEnvironment(),
       cwd,
       stdio: ['pipe', 'ignore', 'pipe'],
     })
@@ -272,6 +327,22 @@ function zipFiles(cwd, output, files) {
     })
     child.stdin.end(`${files.join('\n')}\n`)
   })
+}
+
+function zipEnvironment() {
+  return {
+    PATH: process.env.PATH ?? '',
+    ...(process.platform === 'win32' && process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    LANG: 'C',
+    LC_ALL: 'C',
+  }
+}
+
+function abortError(message) {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  error.code = 'CANCELLED'
+  return error
 }
 
 export function descriptorForBridge(descriptor) {

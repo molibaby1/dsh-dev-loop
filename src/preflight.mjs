@@ -1,22 +1,21 @@
 import { access, lstat } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { checkZipAvailable } from './artifacts.mjs'
 import { DevLoopError, isAbortError } from './diagnostics.mjs'
 
-export function createPreflightChecker({ runCommand, bridge, runtime = {} } = {}) {
-  if (typeof runCommand !== 'function') throw new Error('preflight runCommand is required')
+export function createPreflightChecker({ gitAdapter, checkZip = checkZipAvailable, bridge, runtime = {} } = {}) {
+  if (typeof gitAdapter !== 'function') throw new Error('preflight fixed Git adapter is required')
+  if (typeof checkZip !== 'function') throw new Error('preflight fixed ZIP check is required')
   return async function preflight({ projectRoot, artifactRoot, signal } = {}) {
     throwIfAborted(signal)
     const project = await checkProjectRoot(projectRoot)
     const artifacts = await checkArtifactRoot(artifactRoot, project)
-    const git = await checkCommand(runCommand, {
-      command: 'git', args: ['rev-parse', '--show-toplevel'], cwd: project, signal,
-      code: 'GIT_UNAVAILABLE', label: 'git',
-    })
-    const zip = await checkCommand(runCommand, {
-      command: 'zip', args: ['-v'], cwd: project, signal,
-      code: 'ZIP_UNAVAILABLE', label: 'zip',
-    })
+    const git = await checkGit(gitAdapter, project, signal)
+    const zip = await checkZip({ signal })
+    if (zip?.exitCode !== 0 || zip?.timedOut || zip?.aborted) {
+      throw new DevLoopError('ZIP_UNAVAILABLE', `zip environment check failed: ${zip?.timedOut ? 'timed out' : zip?.aborted ? 'cancelled' : zip?.stderr ?? `exit ${zip?.exitCode}`}`)
+    }
     checkRuntime(runtime)
     let bridgeStatus = { ok: true, checked: false }
     if (typeof bridge?.probe === 'function') bridgeStatus = await bridge.probe({ signal })
@@ -25,7 +24,7 @@ export function createPreflightChecker({ runCommand, bridge, runtime = {} } = {}
       checkedAt: new Date().toISOString(),
       projectRoot: project,
       artifactRoot: artifacts,
-      git: { ok: true, root: String(git.stdout ?? '').trim() || project },
+      git: { ok: true, root: String(git.stdout ?? '').trim() },
       zip: { ok: true },
       bridge: bridgeStatus,
       runtime: {
@@ -70,16 +69,15 @@ async function checkArtifactRoot(value, projectRoot) {
   return root
 }
 
-async function checkCommand(runCommand, options) {
+async function checkGit(gitAdapter, projectRoot, signal) {
   try {
-    const result = await runCommand(options)
-    if (result?.exitCode !== 0) {
-      throw new Error(`${options.label} exited with ${result?.exitCode}: ${String(result?.stderr ?? '').trim()}`)
-    }
+    const result = await gitAdapter({ operation: 'root', repoRoot: projectRoot, signal })
+    if (result?.exitCode !== 0 || result?.timedOut || result?.aborted || result?.outputLimitExceeded) throw new Error(`git exited with ${result?.exitCode}: ${String(result?.stderr ?? '').trim()}`)
+    if (String(result.stdout ?? '').trim() !== projectRoot) throw new Error('git reported a different repository root')
     return result
   } catch (error) {
-    if (isAbortError(error, options.signal)) throw error
-    throw new DevLoopError(options.code, `${options.label} environment check failed: ${error.message}`, { cause: error })
+    if (isAbortError(error, signal)) throw error
+    throw new DevLoopError('GIT_UNAVAILABLE', `git environment check failed: ${error.message}`, { cause: error })
   }
 }
 

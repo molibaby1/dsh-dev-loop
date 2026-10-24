@@ -1,6 +1,8 @@
 import { isAbsolute, relative, resolve } from 'node:path'
 import { createDshDevLoopController } from './host.mjs'
+import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 import { diagnosticForInput, diagnosticFromError } from './diagnostics.mjs'
+import { assertConfiguredProjectRoot } from './project-root.mjs'
 import { DEV_LOOP_EVENTS, summarizeResult } from './presentation.mjs'
 import { DEV_LOOP_VERSION } from './version.mjs'
 
@@ -25,13 +27,9 @@ export function parseDevLoopInput(rawInput, defaults = {}) {
       },
     }
   }
-  const projectRoot = input.projectRoot ?? defaults.projectRoot
-  const artifactRoot = input.artifactRoot ?? defaults.artifactRoot
+  const projectRoot = assertConfiguredProjectRoot(defaults.projectRoot, input.projectRoot)
+  const artifactRoot = assertConfiguredArtifactRoot(defaults.artifactRoot, input.artifactRoot)
   const problemPackage = input.problemPackage ?? input.problem
-  if (typeof projectRoot !== 'string' || projectRoot.trim() === '') throw new Error('projectRoot is required')
-  if (!isAbsolute(projectRoot)) throw new Error('projectRoot must be absolute')
-  if (typeof artifactRoot !== 'string' || artifactRoot.trim() === '') throw new Error('artifactRoot is required')
-  if (!isAbsolute(artifactRoot)) throw new Error('artifactRoot must be absolute')
   if (!problemPackage || typeof problemPackage !== 'object' || Array.isArray(problemPackage)) throw new Error('problemPackage must be a JSON object')
   const autoApprove = defaults.autoApprove === true
   if (resolve(projectRoot) === resolve(artifactRoot) || isInside(resolve(projectRoot), resolve(artifactRoot))) {
@@ -62,7 +60,7 @@ export async function executeDevLoopCommand({ ctx, config = {}, invocation } = {
   try {
     if (action) return await executeControlAction({ ctx, config, invocation, action })
     const request = parseDevLoopInput(rawInput, config)
-    const controller = await createDshDevLoopController({ ctx, config: { ...config, ...request } })
+    const controller = await createDshDevLoopController({ ctx, config: { ...config, ...request, artifactRoot: config.artifactRoot } })
     const linked = linkAbortSignal(signal)
     let promise
     const onEvent = event => {

@@ -3,15 +3,17 @@ import { ArtifactStore } from './artifacts.mjs'
 import { BridgeClient } from './bridge-client.mjs'
 import { DevLoopController } from './controller.mjs'
 import { createDshCodexExecutor } from './dsh-executor.mjs'
-import { createEvidenceCollector } from './evidence.mjs'
+import { createEvidenceCollector, createGitEvidenceAdapter } from './evidence.mjs'
 import { DevLoopError } from './diagnostics.mjs'
 import { createPreflightChecker } from './preflight.mjs'
+import { assertConfiguredProjectRoot } from './project-root.mjs'
 
 /** Compose the Controller inside an already-mounted DSH host. */
 export async function createDshDevLoopController({ ctx, config = {} } = {}) {
   if (!ctx) throw new Error('DSH context is required')
   const artifactRoot = config.artifactRoot
   if (!artifactRoot) throw new Error('artifactRoot is required')
+  const projectRoot = assertConfiguredProjectRoot(config.projectRoot)
   let store
   try {
     store = await new ArtifactStore({
@@ -33,13 +35,20 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
     model: config.model,
     permissionPreset: config.permissionPreset,
   })
+  const gitAdapter = createGitEvidenceAdapter({
+    projectRoot,
+    artifactRoot: store.root,
+  })
   const evidenceCollector = createEvidenceCollector({
     store,
+    gitAdapter,
+    artifactRoot: store.root,
+    testExecutor: request => executor.executeTest(request),
     testCommand: config.testCommand,
   })
   const agentPresets = ctx.agentPresets ?? ctx.get?.('agentPresets')
   const preflight = createPreflightChecker({
-    runCommand: evidenceCollector.runCommand,
+    gitAdapter,
     bridge,
     runtime: {
       agents: Boolean(ctx.agents),
@@ -52,6 +61,8 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
     bridge,
     executor,
     evidenceCollector,
+    gitAdapter,
+    projectRoot: gitAdapter.projectRoot,
     preflight,
     maxFixes: 1,
   })
