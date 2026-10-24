@@ -9,8 +9,10 @@ import { createPreflightChecker } from './preflight.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 
 /** Compose the Controller inside an already-mounted DSH host. */
-export async function createDshDevLoopController({ ctx, config = {} } = {}) {
+export async function createDshDevLoopController({ ctx, config = {}, sessionId } = {}) {
   if (!ctx) throw new Error('DSH context is required')
+  const mode = config.mode ?? 'legacy'
+  if (!['legacy', 'manual-handoff'].includes(mode)) throw new Error(`unsupported dev-loop mode: ${String(mode)}`)
   const artifactRoot = config.artifactRoot
   if (!artifactRoot) throw new Error('artifactRoot is required')
   const projectRoot = assertConfiguredProjectRoot(config.projectRoot)
@@ -24,11 +26,13 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
   } catch (error) {
     throw new DevLoopError('ARTIFACT_ROOT_INVALID', `artifactRoot initialization failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
   }
-  const bridge = new BridgeClient({
-    baseUrl: config.bridgeBaseUrl,
-    token: await resolveBridgeToken(config),
-    timeoutMs: config.bridgeTimeoutMs,
-  })
+  const bridge = mode === 'legacy'
+    ? new BridgeClient({
+      baseUrl: config.bridgeBaseUrl,
+      token: await resolveBridgeToken(config),
+      timeoutMs: config.bridgeTimeoutMs,
+    })
+    : undefined
   const executor = createDshCodexExecutor({
     ctx,
     provider: config.provider,
@@ -50,6 +54,7 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
   const preflight = createPreflightChecker({
     gitAdapter,
     bridge,
+    transport: mode === 'manual-handoff' ? 'manual-handoff' : 'bridge',
     runtime: {
       agents: Boolean(ctx.agents),
       agentPresets: Boolean(agentPresets?.mount),
@@ -62,7 +67,9 @@ export async function createDshDevLoopController({ ctx, config = {} } = {}) {
     executor,
     evidenceCollector,
     gitAdapter,
+    mode,
     projectRoot: gitAdapter.projectRoot,
+    sessionId,
     preflight,
     maxFixes: 1,
   })

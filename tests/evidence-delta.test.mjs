@@ -37,3 +37,27 @@ test('evidence delta excludes pre-existing dirty content and includes new files'
   assert.match(delta, /-pre-existing-dirty/)
 
 })
+
+test('manual handoff context checks use distinct persisted snapshot names', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-context-snapshots-'))
+  const repo = join(root, 'repo')
+  const artifacts = join(root, 'artifacts')
+  await mkdir(repo, { recursive: true })
+  await mkdir(artifacts, { recursive: true })
+  git(['init'], repo)
+  git(['config', 'user.email', 'test@example.invalid'], repo)
+  git(['config', 'user.name', 'DSH Test'], repo)
+  await writeFile(join(repo, 'existing.txt'), 'fixture\n')
+  git(['add', 'existing.txt'], repo)
+  git(['commit', '-m', 'fixture'], repo)
+  const gitAdapter = createGitEvidenceAdapter({ projectRoot: repo, artifactRoot: artifacts })
+  const snapshotRoot = join(gitAdapter.artifactRoot, '.snapshots')
+
+  const approval = await captureGitSnapshot({ repoRoot: repo, gitAdapter, snapshotRoot, snapshotName: 'approval-check' })
+  const after = await captureGitSnapshot({ repoRoot: repo, gitAdapter, snapshotRoot, snapshotName: 'after-round-0' })
+  const reviewer = await captureGitSnapshot({ repoRoot: repo, gitAdapter, snapshotRoot, snapshotName: 'reviewer-current' })
+
+  assert.match(approval.snapshotDir, /approval-check$/)
+  assert.match(after.snapshotDir, /after-round-0$/)
+  assert.match(reviewer.snapshotDir, /reviewer-current$/)
+})

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { accessSync, constants as fsConstants, lstatSync, realpathSync } from 'node:fs'
-import { lstat, mkdir, readdir, realpath, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, realpath, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 
 const DEFAULT_EXCLUDED_DIRS = new Set([
@@ -30,7 +30,9 @@ async function canonicalExisting(pathValue, label) {
   try {
     return await realpath(pathValue)
   } catch (error) {
-    throw new Error(`${label} is not accessible: ${error instanceof Error ? error.message : String(error)}`)
+    const wrapped = new Error(`${label} is not accessible: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+    if (typeof error?.code === 'string') wrapped.code = error.code
+    throw wrapped
   }
 }
 
@@ -84,6 +86,23 @@ export class ArtifactStore {
     return canonical
   }
 
+  /** List existing run directories after rejecting unsafe names and symlink targets. */
+  async listRunIds() {
+    if (!this.root) await this.init()
+    const entries = await readdir(this.root, { withFileTypes: true })
+    const runIds = []
+    for (const entry of entries) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.name)) continue
+      const pathValue = join(this.root, entry.name)
+      const info = await lstat(pathValue)
+      if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`unsafe run artifact path: ${entry.name}`)
+      const canonical = await canonicalExisting(pathValue, 'run artifact root')
+      if (!isInside(this.root, canonical)) throw new Error(`run root symlink escapes artifact root: ${entry.name}`)
+      runIds.push(entry.name)
+    }
+    return runIds.sort()
+  }
+
   async writeBytes({ runId, stage, name, mime, bytes, source = 'controller' }) {
     if (!Buffer.isBuffer(bytes) && !(bytes instanceof Uint8Array)) throw new Error('artifact bytes must be binary')
     const value = Buffer.from(bytes)
@@ -104,6 +123,41 @@ export class ArtifactStore {
     return this.writeText({ ...options, mime: options.mime ?? 'application/json', text: `${JSON.stringify(options.value, null, 2)}\n` })
   }
 
+  async writeJsonOnce({ runId, stage, name, value, source = 'controller' }) {
+    const safeName = safeArtifactName(name)
+    const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8')
+    if (bytes.byteLength > this.maxArtifactBytes) throw new Error(`artifact exceeds byte limit: ${safeName}`)
+    const root = await this.runRoot(runId)
+    const localPath = join(root, safeName)
+    let handle
+    try {
+      handle = await open(localPath, 'wx', 0o600)
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        throw Object.assign(new Error(`artifact already exists: ${safeName}`), { code: 'ARTIFACT_ALREADY_EXISTS', cause: error })
+      }
+      throw error
+    }
+    try {
+      await handle.writeFile(bytes)
+      await handle.sync()
+    } catch (error) {
+      await handle.close()
+      await rm(localPath, { force: true })
+      throw error
+    }
+    await handle.close()
+    return this.#descriptor({
+      runId,
+      stage,
+      name: safeName,
+      mime: 'application/json',
+      localPath,
+      source,
+      bytes: bytes.byteLength,
+    })
+  }
+
   async readJson({ runId, name }) {
     return JSON.parse((await this.#readBytes({ runId, name })).toString('utf8'))
   }
@@ -115,13 +169,32 @@ export class ArtifactStore {
     return JSON.parse(bytes.toString('utf8'))
   }
 
+  async verifyArtifact({ runId, name, sha256 }) {
+    if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256)) throw new Error('artifact SHA-256 is invalid')
+    const bytes = await this.#readBytes({ runId, name })
+    const actual = createHash('sha256').update(bytes).digest('hex')
+    if (actual !== sha256) throw new Error(`artifact hash changed: ${name}`)
+    return true
+  }
+
   async #readBytes({ runId, name }) {
-    const root = await this.runRoot(runId)
+    const root = await this.#existingRunRoot(runId)
     const pathValue = join(root, safeArtifactName(name))
     const canonical = await canonicalExisting(pathValue, 'artifact')
     if (!isInside(root, canonical)) throw new Error('artifact read path escapes run root')
     await assertRegularFile(canonical, 'artifact')
     return readFile(canonical)
+  }
+
+  async #existingRunRoot(runId) {
+    if (!this.root) await this.init()
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(runId)) throw new Error('invalid runId')
+    const pathValue = join(this.root, runId)
+    const info = await lstat(pathValue)
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('run artifact root must be an existing regular directory')
+    const canonical = await canonicalExisting(pathValue, 'run artifact root')
+    if (!isInside(this.root, canonical)) throw new Error('run root symlink escapes artifact root')
+    return canonical
   }
 
   async stageFile({ runId, stage, name, mime, sourcePath, source = 'controller' }) {

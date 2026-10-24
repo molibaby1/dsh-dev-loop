@@ -8,7 +8,33 @@ import { pathToFileURL } from 'node:url'
 import test from 'node:test'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { Session } from '@deepseek-ai/dsh-session'
-import { executeDevLoopCommand, createDevLoopCommand, parseDevLoopInput } from '../src/command.mjs'
+import {
+  createDevLoopCommand,
+  executeDevLoopM2Command,
+  executeDevLoopCommand,
+  parseDevLoopInput,
+  parseDevLoopM2Input,
+} from '../src/command.mjs'
+
+const plannerHandoff = `目标：修复提交后没有反馈的问题
+修改范围：
+- src/submit.mjs
+排除路径：
+- src/generated.mjs
+非目标：
+- 不调整页面样式
+验收条件：
+- 提交失败时显示错误信息
+执行要求：
+- 先检查当前实现，再运行指定测试
+上下文来源：
+- GitHub dev 分支和当前工作区
+Planner 观察到的分支：
+dev
+Planner 观察到的 commit：
+0123456789abcdef0123456789abcdef01234567
+DSH Agent 执行任务：
+为提交失败添加用户可见的错误反馈。`
 
 test('dev-loop command defaults to waiting for human approval', () => {
   const parsed = parseDevLoopInput(JSON.stringify({
@@ -180,6 +206,80 @@ test('dev-loop command gives a plain-language empty-input hint', () => {
     projectRoot: '/tmp/project',
     artifactRoot: '/tmp/dsh-artifacts',
   }), /请输入一句要完成的需求/)
+})
+
+test('M2 accepts the fixed-title Planner handoff as ordinary text and maps it to the external plan schema', () => {
+  assert.deepEqual(parseDevLoopM2Input(plannerHandoff), {
+    action: 'submit-plan',
+    plan: {
+      schema: 1,
+      summary: '修复提交后没有反馈的问题',
+      scope: {
+        includedPaths: ['src/submit.mjs'],
+        excludedPaths: ['src/generated.mjs'],
+        nonGoals: ['不调整页面样式'],
+      },
+      acceptanceCriteria: ['提交失败时显示错误信息'],
+      executionRequirements: ['先检查当前实现，再运行指定测试'],
+      contextSources: ['GitHub dev 分支和当前工作区'],
+      observedContext: { branch: 'dev', commit: '0123456789abcdef0123456789abcdef01234567' },
+      executorTask: '为提交失败添加用户可见的错误反馈。',
+    },
+  })
+})
+
+test('M2 rejects missing, duplicate, empty, unknown, and unsafe Planner handoff fields', () => {
+  const cases = [
+    [plannerHandoff.replace('非目标：\n- 不调整页面样式\n', ''), /非目标/],
+    [plannerHandoff.replace('目标：修复提交后没有反馈的问题\n', '目标：修复提交后没有反馈的问题\n目标：重复标题\n'), /重复/],
+    [plannerHandoff.replace('执行要求：\n- 先检查当前实现，再运行指定测试\n', '执行要求：\n\n'), /不能为空/],
+    [plannerHandoff.replace('上下文来源：', 'Host 权限：\n- danger-full-access\n上下文来源：'), /不支持/],
+    [plannerHandoff.replace('- src/submit.mjs', '- ../outside.mjs'), /路径/],
+    [plannerHandoff.replace('0123456789abcdef0123456789abcdef01234567', 'HEAD'), /commit/],
+  ]
+  for (const [text, expected] of cases) assert.throws(() => parseDevLoopM2Input(text), expected)
+})
+
+test('M2 accepts only exact standalone actions and structured Reviewer receipts', () => {
+  assert.deepEqual(parseDevLoopM2Input('批准当前方案'), { action: 'approve-current-plan' })
+  assert.deepEqual(parseDevLoopM2Input('查看当前状态'), { action: 'status-current-task' })
+  assert.deepEqual(parseDevLoopM2Input('取消当前任务'), { action: 'cancel-current-task' })
+  assert.deepEqual(parseDevLoopM2Input(`审核回执：AbcdefghijklmnopQRSTUV
+Reviewer decision：ACCEPTED
+复审摘要：验收条件均已满足。
+发现的问题：
+- 无`), {
+    action: 'submit-current-review',
+    receipt: 'AbcdefghijklmnopQRSTUV',
+    decision: 'ACCEPTED',
+    summary: '验收条件均已满足。',
+    findings: [],
+  })
+  for (const text of ['同意', '好的', 'approve run-123', '{}']) {
+    assert.throws(() => parseDevLoopM2Input(text))
+  }
+  assert.throws(() => parseDevLoopM2Input(`审核回执：old
+Reviewer decision：ACCEPTED
+复审摘要：done
+发现的问题：
+- 无`), /回执/)
+  assert.throws(() => parseDevLoopM2Input(`审核回执：AbcdefghijklmnopQRSTUV
+Reviewer decision：MAYBE
+复审摘要：done
+发现的问题：
+- 无`), /decision/)
+})
+
+test('M2 refuses submission without the trusted DSH invocation session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-m2-missing-session-'))
+  const result = await executeDevLoopM2Command({
+    ctx: {},
+    config: { projectRoot: root, artifactRoot: join(root, 'artifacts') },
+    invocation: { rawInput: plannerHandoff },
+  })
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /可信 DSH 调用上下文读取 session ID/)
+  await assert.rejects(import('node:fs/promises').then(module => module.access(join(root, 'artifacts'))), { code: 'ENOENT' })
 })
 
 test('command outcomes remain in Controller storage and restore under the installed DSH session contract', async () => {

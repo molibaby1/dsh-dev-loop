@@ -18,9 +18,11 @@ npm run package:fixture
 
 `npm test` uses only fake Bridge/Executor/CDP seams. It does not consume ChatGPT or Codex quota.
 
-## 最简单的用法
+## 历史兼容入口：`/dev-loop`
 
-完成一次 Web profile 配置后，日常使用只需要输入一条需求：
+`/dev-loop` 保留原有内置方案流，适用于已配置的 Web profile。新的人工转交流程推荐使用 `/dev-loop-m2`；它由用户把 ChatGPT 生成的固定标题文本转交给 DSH，不依赖 Bridge 或项目 ZIP。
+
+原入口仍可接收自然语言需求：
 
 ```text
 /dev-loop 修复登录页提交后没有反应的问题
@@ -32,6 +34,66 @@ npm run package:fixture
 ```text
 /dev-loop approve run-xxxxxxxx
 ```
+
+## 推荐入口：M2 普通文本人工交接
+
+`/dev-loop-m2` 是离线人工交接入口，不调用 Bridge、不生成或上传项目 ZIP。Planner 方案和 Reviewer 结论由用户从 ChatGPT Web 转交；固定标题只是普通文本协议，不认证 ChatGPT 身份。项目根目录、工件目录、测试命令和 DSH 权限来自可信 Host 配置，文本内容不能更改这些设置。
+
+先把 Planner 生成的方案整体粘贴到 `/dev-loop-m2`。以下十个标题必须各出现一次，路径必须是仓库相对路径；`修改范围` 至少列出一个路径。无排除路径或非目标时填写 `- 无`。分支和 commit 必须来自 Planner 观察到的 Git 状态：
+
+```text
+/dev-loop-m2
+目标：修复提交失败时没有反馈的问题
+修改范围：
+- src/submit.mjs
+- tests/submit.test.mjs
+排除路径：
+- src/generated.mjs
+非目标：
+- 不调整页面样式
+验收条件：
+- 提交失败时显示错误信息
+执行要求：
+- 先检查现有实现，再运行配置的测试命令
+上下文来源：
+- GitHub dev 分支与当前工作区
+Planner 观察到的分支：
+dev
+Planner 观察到的 commit：
+<完整 Git commit SHA>
+DSH Agent 执行任务：
+为提交失败增加用户可见的错误反馈。
+```
+
+提交只保存方案并进入 `WAITING_FOR_APPROVAL`，不会调用 DSH Agent 或修改项目。接着在同一个 DSH 会话单独执行批准命令：
+
+```text
+/dev-loop-m2 批准当前方案
+```
+
+批准前 Controller 会重新检查方案哈希、可信项目根目录、分支和工作区状态。随后由 DSH Agent 在原生审批下执行；DSH 审批拒绝、取消、超时、审批证据缺失、测试失败或范围越界都会停止，不会切换到宿主备用执行器。执行和取证完成后进入 `REVIEWING`，命令会显示唯一审核回执、证据目录和 `evidence-manifest.json` 路径。把回执、当前变更和 Reviewer 所需证据交给 ChatGPT Reviewer 人工检查。
+
+Reviewer 应返回审核回执、decision、摘要和发现的问题，再把其结果粘贴到 `/dev-loop-m2`。标题和 decision 值必须精确填写；无发现时写 `- 无`：
+
+```text
+/dev-loop-m2 提交复审结果
+审核回执：<原样粘贴 Host 显示的回执>
+Reviewer decision：ACCEPTED
+复审摘要：变更范围与证据均已核对。
+发现的问题：
+- 无
+```
+
+Reviewer decision 只接受 `ACCEPTED`、`NEEDS_FIX`、`NEEDS_REPLAN`、`DEFER` 或 `ESCALATE`。只有回执仍对应当前 run、方案、证据和完整项目状态，且 DSH 测试通过时，`ACCEPTED` 才会进入 `COMPLETE`；其他结论进入 `STOPPED`，不会自动重新执行。
+
+同一 DSH session 内可用以下独立命令操作；普通聊天里的“同意”“好的”不会批准方案。Controller 会把可信 DSH session ID 与方案持久关联，恢复后仍可查询；零个、多个、损坏或状态不匹配的候选都会拒绝，不会猜测“最近一次运行”。
+
+```text
+/dev-loop-m2 查看当前状态
+/dev-loop-m2 取消当前任务
+```
+
+本入口完成离线实现和安全回归，不代表真实 ChatGPT Web ↔ DSH Agent 交接已验收。
 
 ## CLI（高级/调试用法）
 

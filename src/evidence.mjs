@@ -291,7 +291,7 @@ function safeRelativeFile(file) {
 }
 
 function safeSnapshotName(value) {
-  if (value !== 'baseline' && !/^after-round-\d+$/u.test(value)) {
+  if (!['baseline', 'approval-check', 'reviewer-current'].includes(value) && !/^after-round-\d+$/u.test(value)) {
     throw new Error(`unsupported snapshot name: ${String(value)}`)
   }
   return value

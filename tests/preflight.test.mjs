@@ -33,6 +33,28 @@ test('preflight reports successful read-only dependency checks', async () => {
   assert.equal(result.bridge.checked, true)
 })
 
+test('manual handoff preflight checks project runtime without ZIP or Bridge probes', async () => {
+  const { projectRoot, artifactRoot } = await roots()
+  let zipChecks = 0
+  let bridgeChecks = 0
+  const checker = createPreflightChecker({
+    gitAdapter: async request => ({ exitCode: 0, stdout: request.operation === 'root' ? `${projectRoot}\n` : '', stderr: '' }),
+    checkZip: async () => { zipChecks += 1; return { exitCode: 0, stderr: '' } },
+    bridge: { probe: async () => { bridgeChecks += 1; return { ok: true, checked: true } } },
+    runtime: { agents: true, agentPresets: true, permissionPresets: true },
+    transport: 'manual-handoff',
+  })
+
+  const result = await checker({ projectRoot, artifactRoot })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.transport, 'manual-handoff')
+  assert.equal(result.zip.skipped, true)
+  assert.equal(result.bridge.skipped, true)
+  assert.equal(zipChecks, 0)
+  assert.equal(bridgeChecks, 0)
+})
+
 test('preflight rejects an artifact root that is a regular file', async () => {
   const { projectRoot, artifactRoot } = await roots()
   const artifactFile = join(artifactRoot, 'not-a-directory')

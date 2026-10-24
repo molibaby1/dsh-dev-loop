@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -57,6 +61,35 @@ class MockAdapter extends LlmAdapter {
   }
 }
 
+class ManualHandoffAdapter extends LlmAdapter {
+  calls = 0
+
+  constructor({ cwd }) {
+    super()
+    this.cwd = cwd
+  }
+
+  async *stream() {
+    this.calls += 1
+    const tool = this.calls === 1
+      ? { id: 'm2-write-call', name: 'bash', arguments: { description: 'Write the approved fixture output', command: 'write-fixture-output', workdir: this.cwd } }
+      : this.calls === 3
+        ? { id: 'm2-test-call', name: 'bash', arguments: { description: 'Run the configured test command', command: "'npm' 'test'", workdir: this.cwd } }
+        : undefined
+    if (tool) {
+      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+      yield { type: 'block-end', index: 0, block: { type: 'tool-call', ...tool, arguments: JSON.stringify(tool.arguments) } }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      return
+    }
+    const text = 'FAKE_DSH_AGENT_DONE'
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text }
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
 function registerFakeBash(ctx, execute) {
   ctx.tools.register(defineTool({
     name: 'bash',
@@ -76,6 +109,67 @@ function registerFakeBash(ctx, execute) {
     },
     execute,
   }))
+}
+
+function requireMainM2ToolApproval(ctx) {
+  const events = []
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    const sessionId = String(exec.agent?.session?.id ?? '')
+    if (exec.name !== 'bash' || !sessionId.startsWith('dev-loop-') || /-round-\d+-test$/.test(sessionId)) return next()
+    return { kind: 'ask', reason: 'M2 fixture requires native DSH approval for project writes' }
+  })
+  ctx.on('session/event', (session, event) => {
+    const sessionId = String(session.id)
+    if (sessionId.startsWith('dev-loop-') && !/-round-\d+-test$/.test(sessionId)
+      && (event.type === 'approval/asked' || event.type === 'approval/decided')) {
+      events.push({ sessionId, event })
+    }
+  })
+  return events
+}
+
+function fixtureGit(cwd, args) {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' })
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`)
+  return result.stdout.trim()
+}
+
+function plannerHandoffText({ commit, summary = 'Create a fixture output file.', executorTask = 'Create result.txt with the approved fixture output.' }) {
+  return `目标：${summary}
+修改范围：
+- result.txt
+排除路径：
+- 无
+非目标：
+- 不提交或推送代码
+验收条件：
+- result.txt contains fixture output
+执行要求：
+- Use the configured project root and run the configured test command
+上下文来源：
+- GitHub molibaby1/dsh-dev-loop@m2-fixture
+- local test fixture
+Planner 观察到的分支：
+m2-fixture
+Planner 观察到的 commit：
+${commit}
+DSH Agent 执行任务：
+${executorTask}`
+}
+
+function reviewerHandoffText(receipt, { decision = 'ACCEPTED', summary = 'Verified the changed file and passing test evidence.', findings = ['无'] } = {}) {
+  return `提交复审结果
+审核回执：${receipt}
+Reviewer decision：${decision}
+复审摘要：${summary}
+发现的问题：
+${findings.map(finding => `- ${finding}`).join('\n')}`
+}
+
+async function onlyRunId(artifactRoot) {
+  const runIds = await readdir(artifactRoot)
+  assert.equal(runIds.length, 1)
+  return runIds[0]
 }
 
 async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(), pluginConfig = {}, testApprovalOutcome } = {}) {
@@ -109,7 +203,9 @@ async function assertDevLoopCommand(ctx) {
       await ctx.agentPresets.mount(agentCtx)
     },
   })
-  assert.ok(ctx.commands.list(probe.agent).some(command => command.name === 'dev-loop'))
+  const names = ctx.commands.list(probe.agent).map(command => command.name)
+  assert.ok(names.includes('dev-loop'))
+  assert.ok(names.includes('dev-loop-m2'))
   await probe.dispose()
 }
 
@@ -145,6 +241,204 @@ test('DSH 0.2.1-rc.2 Agent turn reports events and keeps native approval default
     approval: 'ask',
     seeded: false,
   })
+})
+
+test('M2 command runs through a Fake DSH Agent, native approval, and resumable external review without ZIP or Bridge', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-m2-dsh-integration-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectRoot = join(root, 'project')
+  const artifactRoot = join(root, 'artifacts')
+  await mkdir(projectRoot)
+  await writeFile(join(projectRoot, 'README.md'), 'fixture project\n')
+  fixtureGit(projectRoot, ['init', '--quiet', '--initial-branch=m2-fixture'])
+  fixtureGit(projectRoot, ['config', 'user.name', 'M2 Fixture'])
+  fixtureGit(projectRoot, ['config', 'user.email', 'm2-fixture@example.invalid'])
+  fixtureGit(projectRoot, ['add', 'README.md'])
+  fixtureGit(projectRoot, ['commit', '--quiet', '-m', 'fixture baseline'])
+  const commit = fixtureGit(projectRoot, ['rev-parse', 'HEAD'])
+  const adapter = new ManualHandoffAdapter({ cwd: await realpath(projectRoot) })
+  const { ctx } = await createWebComposition(t, livePlugin, {
+    adapter,
+    pluginConfig: {
+      modulePath: new URL('../src/index.mjs', import.meta.url).href,
+      projectRoot,
+      artifactRoot,
+      testCommand: ['npm', ['test']],
+      bridgeTokenFile: join(root, 'must-not-be-read.json'),
+    },
+    testApprovalOutcome: 'allowed-once',
+  })
+  const nativeApprovalEvents = requireMainM2ToolApproval(ctx)
+  let bashExecutions = 0
+  registerFakeBash(ctx, async args => {
+    bashExecutions += 1
+    if (args.command === 'write-fixture-output') await writeFile(join(args.workdir, 'result.txt'), 'fixture output\n')
+    return {
+      kind: 'foreground', cwd: args.workdir, exitCode: 0, signal: null,
+      timedOut: false, aborted: false, timeoutMs: 30_000,
+      stdout: { text: args.command === "'npm' 'test'" ? 'PASS' : 'WROTE_FIXTURE', truncated: false },
+      stderr: { text: '', truncated: false },
+      sandbox: { mode: 'workspace-write', denied: false, enforcement: 'full' },
+    }
+  })
+  const probe = await ctx.agents.create({
+    sessionId: SessionId('m2-command-probe'),
+    setup: async agentCtx => { await ctx.agentPresets.mount(agentCtx) },
+  })
+  t.after(() => probe.dispose())
+  const command = ctx.commands.list(probe.agent).find(item => item.name === 'dev-loop-m2')
+  assert.ok(command, 'the manual M2 command must be registered in the DSH Web composition')
+  const invocation = async rawInput => {
+    const execution = await ctx.commands.execute(
+      probe.agent,
+      `/dev-loop-m2 ${rawInput}`,
+      [],
+      new AbortController().signal,
+    )
+    assert.ok(execution, 'the DSH command runtime must resolve the manual M2 entry')
+    return execution.result
+  }
+  const submitted = await invocation(plannerHandoffText({ commit }))
+  assert.equal(submitted.kind, 'success', submitted.text)
+  const runId = await onlyRunId(artifactRoot)
+  const runRoot = join(artifactRoot, runId)
+  const canonicalRunRoot = await realpath(runRoot)
+  const runRequest = JSON.parse(await readFile(join(runRoot, 'run-request.json'), 'utf8'))
+  assert.equal(runRequest.sessionId, String(probe.agent.session.id))
+  assert.match(submitted.text, /尚未调用 DSH Agent/)
+  assert.equal(adapter.calls, 0)
+  assert.equal(bashExecutions, 0)
+  const approvalStatus = await invocation('查看当前状态')
+  assert.match(approvalStatus.text, /状态：WAITING_FOR_APPROVAL/)
+
+  const approved = await invocation('批准当前方案')
+  assert.equal(approved.kind, 'success', approved.text)
+  assert.match(approved.text, /状态：REVIEWING/)
+  const reviewReceipt = approved.text.match(/审核回执：([A-Za-z0-9_-]{22})/)?.[1]
+  assert.ok(reviewReceipt)
+  assert.ok(approved.text.includes(`证据目录：${canonicalRunRoot}`))
+  assert.ok(approved.text.includes(`证据清单：${join(canonicalRunRoot, 'evidence-manifest.json')}`))
+  assert.equal(adapter.calls, 4)
+  const mainApprovals = nativeApprovalEvents
+    .filter(item => item.sessionId === `dev-loop-${runId}`)
+    .map(item => item.event)
+  assert.deepEqual(mainApprovals.map(event => event.type), ['approval/asked', 'approval/decided'])
+  assert.equal(mainApprovals[0].data.id, mainApprovals[1].data.id)
+  assert.equal(mainApprovals[1].data.outcome, 'allowed-once')
+  assert.equal(await readFile(join(projectRoot, 'result.txt'), 'utf8'), 'fixture output\n')
+  const files = await readdir(runRoot)
+  assert.ok(!files.some(file => file.endsWith('.zip')))
+  const preflight = JSON.parse(await readFile(join(runRoot, 'preflight-approval.json'), 'utf8'))
+  assert.equal(preflight.transport, 'manual-handoff')
+  assert.equal(preflight.zip.skipped, true)
+  assert.equal(preflight.bridge.skipped, true)
+  const evidence = JSON.parse(await readFile(join(runRoot, 'evidence-manifest.json'), 'utf8'))
+  const receiptRecord = JSON.parse(await readFile(join(runRoot, 'review-receipt.json'), 'utf8'))
+  assert.equal(reviewReceipt, receiptRecord.receipt)
+  assert.equal(evidence.planSha256, receiptRecord.planSha256)
+  const reviewStatus = await invocation('查看当前状态')
+  assert.match(reviewStatus.text, /状态：REVIEWING/)
+  assert.match(reviewStatus.text, new RegExp(reviewReceipt))
+  assert.ok(reviewStatus.text.includes(`证据目录：${canonicalRunRoot}`))
+  assert.ok(reviewStatus.text.includes(`证据清单：${join(canonicalRunRoot, 'evidence-manifest.json')}`))
+  const testResult = JSON.parse(await readFile(join(runRoot, 'test-result.json'), 'utf8'))
+  assert.equal(testResult.ok, true, JSON.stringify(testResult))
+  assert.deepEqual(testResult.approvalEvents.map(event => event.type), ['approval/asked', 'approval/decided'])
+  assert.equal(testResult.approvalEvents[1].data.outcome, 'allowed-once')
+  assert.equal(bashExecutions, 2)
+  assert.match(approved.text, /测试结果：通过/)
+  assert.equal(evidence.test.ok, true)
+  assert.ok(evidence.artifacts.some(item => item.source === 'dsh-executor'))
+  assert.ok(evidence.artifacts.some(item => item.source === 'dsh-authorized-test-tool'))
+
+  const completed = await invocation(reviewerHandoffText(reviewReceipt))
+  assert.equal(completed.kind, 'success', completed.text)
+  assert.match(completed.text, /状态：COMPLETE/)
+  assert.equal(adapter.calls, 4)
+  assert.equal(bashExecutions, 2)
+
+  const previousRunIds = new Set(await readdir(artifactRoot))
+  const cancelPlan = await invocation(plannerHandoffText({
+    commit,
+    summary: 'Cancellation fixture plan.',
+    executorTask: 'Do not execute this fixture plan.',
+  }))
+  assert.equal(cancelPlan.kind, 'success')
+  const cancelRunId = (await readdir(artifactRoot)).find(candidate => !previousRunIds.has(candidate))
+  assert.ok(cancelRunId)
+  const cancelled = await invocation('取消当前任务')
+  assert.equal(cancelled.kind, 'error')
+  assert.match(cancelled.text, /状态：CANCELLED/)
+  assert.equal(JSON.parse(await readFile(join(artifactRoot, cancelRunId, 'run-state.json'), 'utf8')).state, 'CANCELLED')
+  assert.equal(adapter.calls, 4)
+  assert.equal(bashExecutions, 2)
+  assert.equal(ctx.agents.roots().length, 1, 'only the retained command probe Agent remains')
+})
+
+test('M2 native DSH approval rejection and cancellation stop before the project tool executes', async t => {
+  for (const outcome of ['rejected', 'cancelled']) {
+    await t.test(outcome, async subtest => {
+      const root = await mkdtemp(join(tmpdir(), `dsh-loop-m2-${outcome}-`))
+      subtest.after(() => rm(root, { recursive: true, force: true }))
+      const projectRoot = join(root, 'project')
+      const artifactRoot = join(root, 'artifacts')
+      await mkdir(projectRoot)
+      await writeFile(join(projectRoot, 'README.md'), 'fixture project\n')
+      fixtureGit(projectRoot, ['init', '--quiet', '--initial-branch=m2-fixture'])
+      fixtureGit(projectRoot, ['config', 'user.name', 'M2 Fixture'])
+      fixtureGit(projectRoot, ['config', 'user.email', 'm2-fixture@example.invalid'])
+      fixtureGit(projectRoot, ['add', 'README.md'])
+      fixtureGit(projectRoot, ['commit', '--quiet', '-m', 'fixture baseline'])
+      const commit = fixtureGit(projectRoot, ['rev-parse', 'HEAD'])
+      const adapter = new ManualHandoffAdapter({ cwd: await realpath(projectRoot) })
+      const { ctx } = await createWebComposition(subtest, livePlugin, {
+        adapter,
+        pluginConfig: {
+          modulePath: new URL('../src/index.mjs', import.meta.url).href,
+          projectRoot,
+          artifactRoot,
+          bridgeTokenFile: join(root, 'must-not-be-read.json'),
+        },
+        testApprovalOutcome: outcome,
+      })
+      const nativeApprovalEvents = requireMainM2ToolApproval(ctx)
+      let bashExecutions = 0
+      registerFakeBash(ctx, async () => {
+        bashExecutions += 1
+        throw new Error('a denied or cancelled approval must not execute the project tool')
+      })
+      const probe = await ctx.agents.create({
+        sessionId: SessionId(`m2-${outcome}-command-probe`),
+        setup: async agentCtx => { await ctx.agentPresets.mount(agentCtx) },
+      })
+      subtest.after(() => probe.dispose())
+      const invoke = async rawInput => {
+        const execution = await ctx.commands.execute(probe.agent, `/dev-loop-m2 ${rawInput}`, [], new AbortController().signal)
+        assert.ok(execution)
+        return execution.result
+      }
+      const submitted = await invoke(plannerHandoffText({
+        commit,
+        summary: 'Attempt one approved fixture write.',
+        executorTask: 'Write result.txt.',
+      }))
+      const runId = await onlyRunId(artifactRoot)
+      assert.equal(submitted.kind, 'success')
+      const request = JSON.parse(await readFile(join(artifactRoot, runId, 'run-request.json'), 'utf8'))
+      assert.equal(request.sessionId, String(probe.agent.session.id))
+      const denied = await invoke('批准当前方案')
+
+      assert.equal(denied.kind, 'error', denied.text)
+      assert.match(denied.text, /状态：FAILED/)
+      assert.equal(bashExecutions, 0)
+      assert.equal(adapter.calls, 2)
+      assert.deepEqual(nativeApprovalEvents.map(item => item.event.type), ['approval/asked', 'approval/decided'])
+      assert.equal(nativeApprovalEvents[1].event.data.outcome, outcome)
+      await assert.rejects(readFile(join(projectRoot, 'result.txt'), 'utf8'), { code: 'ENOENT' })
+      const summary = JSON.parse(await readFile(join(artifactRoot, runId, 'run-summary.json'), 'utf8'))
+      assert.equal(summary.diagnostic.code, 'DSH_TOOL_APPROVAL_FAILED')
+    })
+  }
 })
 
 test('trusted host configuration can explicitly select a higher DSH preset', async t => {

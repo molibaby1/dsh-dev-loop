@@ -1,6 +1,6 @@
 import { createDshDevLoopController } from './host.mjs'
 import { createDshCodexExecutor } from './dsh-executor.mjs'
-import { createDevLoopCommand } from './command.mjs'
+import { createDevLoopCommand, createDevLoopM2Command } from './command.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 
@@ -38,5 +38,6 @@ export function apply(ctx, config = {}) {
   })
   ctx.inject(['commands'], commandCtx => {
     commandCtx.commands.register(createDevLoopCommand({ ctx, config: effectiveConfig }))
+    commandCtx.commands.register(createDevLoopM2Command({ ctx, config: effectiveConfig }))
   })
 }

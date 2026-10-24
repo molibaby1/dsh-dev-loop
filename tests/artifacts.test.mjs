@@ -17,6 +17,28 @@ test('artifact store records hash and rejects oversized bytes', async () => {
   )
 })
 
+test('artifact store creates one-shot control records without replacing an existing record', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-artifact-once-'))
+  const store = await new ArtifactStore({ root }).init()
+  const first = await store.writeJsonOnce({ runId: 'run-once', stage: 'approval', name: 'approval-claim.json', value: { approved: true } })
+
+  await assert.rejects(
+    store.writeJsonOnce({ runId: 'run-once', stage: 'approval', name: 'approval-claim.json', value: { approved: false } }),
+    error => error.code === 'ARTIFACT_ALREADY_EXISTS',
+  )
+  assert.deepEqual(await store.readJson({ runId: 'run-once', name: first.name }), { approved: true })
+})
+
+test('artifact store verifies text artifacts against a persisted SHA-256', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-artifact-verify-'))
+  const store = await new ArtifactStore({ root }).init()
+  const descriptor = await finalizeArtifact(await store.writeText({ runId: 'run-verify', stage: 'evidence', name: 'report.md', text: 'verified report' }))
+
+  assert.equal(await store.verifyArtifact({ runId: 'run-verify', name: 'report.md', sha256: descriptor.sha256 }), true)
+  await store.writeText({ runId: 'run-verify', stage: 'evidence', name: 'report.md', text: 'changed report' })
+  await assert.rejects(store.verifyArtifact({ runId: 'run-verify', name: 'report.md', sha256: descriptor.sha256 }), /artifact hash changed/)
+})
+
 test('project packaging rejects symlink escape and excludes secrets and generated folders', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-loop-project-'))
   const project = join(root, 'project')

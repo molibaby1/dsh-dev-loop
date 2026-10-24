@@ -4,28 +4,34 @@ import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { checkZipAvailable } from './artifacts.mjs'
 import { DevLoopError, isAbortError } from './diagnostics.mjs'
 
-export function createPreflightChecker({ gitAdapter, checkZip = checkZipAvailable, bridge, runtime = {} } = {}) {
+export function createPreflightChecker({ gitAdapter, checkZip = checkZipAvailable, bridge, runtime = {}, transport = 'bridge' } = {}) {
   if (typeof gitAdapter !== 'function') throw new Error('preflight fixed Git adapter is required')
-  if (typeof checkZip !== 'function') throw new Error('preflight fixed ZIP check is required')
+  if (!['bridge', 'manual-handoff'].includes(transport)) throw new Error(`unsupported preflight transport: ${String(transport)}`)
+  if (transport === 'bridge' && typeof checkZip !== 'function') throw new Error('preflight fixed ZIP check is required')
   return async function preflight({ projectRoot, artifactRoot, signal } = {}) {
     throwIfAborted(signal)
     const project = await checkProjectRoot(projectRoot)
     const artifacts = await checkArtifactRoot(artifactRoot, project)
     const git = await checkGit(gitAdapter, project, signal)
-    const zip = await checkZip({ signal })
-    if (zip?.exitCode !== 0 || zip?.timedOut || zip?.aborted) {
-      throw new DevLoopError('ZIP_UNAVAILABLE', `zip environment check failed: ${zip?.timedOut ? 'timed out' : zip?.aborted ? 'cancelled' : zip?.stderr ?? `exit ${zip?.exitCode}`}`)
+    let zipStatus = { ok: true, skipped: true }
+    let bridgeStatus = { ok: true, checked: false, skipped: true }
+    if (transport === 'bridge') {
+      const zip = await checkZip({ signal })
+      if (zip?.exitCode !== 0 || zip?.timedOut || zip?.aborted) {
+        throw new DevLoopError('ZIP_UNAVAILABLE', `zip environment check failed: ${zip?.timedOut ? 'timed out' : zip?.aborted ? 'cancelled' : zip?.stderr ?? `exit ${zip?.exitCode}`}`)
+      }
+      zipStatus = { ok: true }
     }
     checkRuntime(runtime)
-    let bridgeStatus = { ok: true, checked: false }
-    if (typeof bridge?.probe === 'function') bridgeStatus = await bridge.probe({ signal })
+    if (transport === 'bridge' && typeof bridge?.probe === 'function') bridgeStatus = await bridge.probe({ signal })
     return Object.freeze({
       ok: true,
       checkedAt: new Date().toISOString(),
       projectRoot: project,
       artifactRoot: artifacts,
       git: { ok: true, root: String(git.stdout ?? '').trim() },
-      zip: { ok: true },
+      transport,
+      zip: zipStatus,
       bridge: bridgeStatus,
       runtime: {
         agents: runtime.agents !== false,
