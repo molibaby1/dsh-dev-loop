@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -272,6 +273,59 @@ test('terminal runs without settled execution and audit records are not skipped 
   assert.equal(fixture.calls.executor, 1, 'candidate lookup must not start the active plan')
 })
 
+test('terminal candidate lookup rejects summary that contradicts the verified execution audit', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const approved = await (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
+  const stopped = await (await fixture.createController()).submitExternalReview({
+    runId: submitted.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'NEEDS_FIX',
+    summary: 'The terminal fixture really did execute before stopping.',
+    findings: ['Follow-up is recorded without another execution.'],
+  })
+  assert.equal(stopped.state, 'STOPPED')
+  const active = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const runRoot = join(fixture.artifactRoot, stopped.runId)
+  const manifest = await fixture.store.readJson({ runId: stopped.runId, name: 'run-manifest.json' })
+  const audit = await fixture.store.readJson({ runId: stopped.runId, name: 'audit-trace.json' })
+  const summary = await fixture.store.readJson({ runId: stopped.runId, name: 'run-summary.json' })
+  const state = await fixture.store.readJson({ runId: stopped.runId, name: 'run-state.json' })
+  assert.ok(state.audit.some(entry => entry.to === 'EXECUTING'))
+  assert.equal(summary.hasModifiedProject, true)
+
+  summary.hasModifiedProject = false
+  const summaryBytes = Buffer.from(`${JSON.stringify(summary, null, 2)}\n`)
+  await writeFile(join(runRoot, 'run-summary.json'), summaryBytes)
+  const refreshDescriptor = (artifacts, name, bytes) => {
+    const descriptor = artifacts.find(artifact => artifact.name === name)
+    assert.ok(descriptor, `${name} descriptor must be present`)
+    descriptor.bytes = bytes.byteLength
+    descriptor.sha256 = createHash('sha256').update(bytes).digest('hex')
+    return descriptor
+  }
+  refreshDescriptor(manifest.artifacts, 'run-summary.json', summaryBytes)
+  refreshDescriptor(audit.artifacts, 'run-summary.json', summaryBytes)
+
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`)
+  await writeFile(join(runRoot, 'run-manifest.json'), manifestBytes)
+  const manifestDescriptor = refreshDescriptor(audit.artifacts, 'run-manifest.json', manifestBytes)
+  await writeFile(join(runRoot, 'audit-trace.json'), `${JSON.stringify(audit, null, 2)}\n`)
+  assert.equal(await fixture.store.verifyJson({
+    runId: stopped.runId,
+    name: 'run-summary.json',
+    sha256: manifest.artifacts.find(artifact => artifact.name === 'run-summary.json').sha256,
+  }).then(record => record.hasModifiedProject), false)
+  assert.equal(await fixture.store.verifyArtifact({ runId: stopped.runId, name: 'run-manifest.json', sha256: manifestDescriptor.sha256 }), true)
+
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    error => error.code === 'RUN_RECORD_MISMATCH',
+  )
+  assert.equal(active.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(fixture.calls.executor, 1, 'contradictory terminal history must not trigger another execution')
+})
+
 test('active session candidates still require both request and plan artifacts', async t => {
   for (const name of ['run-request.json', 'plan.json']) {
     await t.test(name, async subtest => {
@@ -359,6 +413,10 @@ test('manual approval executes once, persists evidence for a new Controller, the
     })
   })(), /cannot accept an external review from state COMPLETE/)
   assert.equal(fixture.calls.executor, 1)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    { code: 'RUN_SESSION_CANDIDATE_MISSING' },
+  )
 })
 
 test('an external review claim prevents a concurrent cancellation from overwriting its result', async t => {
@@ -836,6 +894,10 @@ test('a fresh Controller cannot report an active DSH execution cancelled while i
   assert.equal(cancelled.state, 'CANCELLED')
   assert.equal(fixture.calls.test, 0)
   await assert.rejects(readFile(join(fixture.projectRoot, 'result.txt'), 'utf8'), { code: 'ENOENT' })
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    { code: 'RUN_SESSION_CANDIDATE_MISSING' },
+  )
 })
 
 test('M2 execution stops when DSH changes a path outside the approved scope', async t => {

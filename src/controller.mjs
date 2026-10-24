@@ -1631,8 +1631,9 @@ async function assertSettledTerminalManualHandoff(store, { runId, state, manifes
   ) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal handoff manifest is incomplete')
   }
+  let machine
   try {
-    new RunStateMachine({ runId, maxFixes: 1, initialSnapshot: state })
+    machine = new RunStateMachine({ runId, maxFixes: 1, initialSnapshot: state })
   } catch (error) {
     throw new DevLoopError('RUN_STATE_INVALID', 'persisted terminal state is invalid', { cause: error })
   }
@@ -1654,6 +1655,9 @@ async function assertSettledTerminalManualHandoff(store, { runId, state, manifes
     ))
   ) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal summary does not match its run state')
+  }
+  if (summary.hasModifiedProject !== hasEnteredExecution(machine)) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal summary does not match its execution audit')
   }
   if (summary.diagnostic != null) {
     const diagnosticDescriptor = findArtifact(manifest, 'diagnostic.json')
