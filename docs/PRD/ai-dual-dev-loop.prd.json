@@ -1,65 +1,64 @@
 {
   "project": "dsh-dev-loop",
   "branchName": "main",
-  "description": "Bounded Planner -> DSH Codex Executor -> Reviewer loop with Bridge attachments and auditable artifacts.",
+  "description": "Bounded ChatGPT Web Planner -> authorized DSH Agent executor -> independent ChatGPT Web Reviewer loop; context is read through connected GitHub/Remote Desktop Commander apps and correlated execution evidence, not mandatory project ZIP or attachment uploads. Human-mediated handoff is acceptable for the first live M2 acceptance; automated app orchestration is not assumed.",
   "userStories": [
     {
       "id": "DL-001",
-      "title": "Create bounded artifact manifests and project packages",
-      "description": "Generate run-scoped ZIP and JSON/Markdown artifacts under a safe local root with canonical-path, byte-limit, hash, and provenance checks.",
+      "title": "Acquire scoped project context through connected tools",
+      "description": "Planner uses GitHub for the observed remote branch/commit and Remote Desktop Commander for necessary unpushed local state, with source/provenance recorded. Codex/DSH reports are supplementary evidence. No project ZIP transport is required.",
       "acceptanceCriteria": [
-        "Each artifact has runId, stage, name, mime, bytes, sha256, and source.",
-        "Symlink escape and oversized artifacts are rejected.",
-        "Packaging never writes into or cleans the product repository."
+        "Planner records relevant repository, branch, observed commit and/or authorized local context source, including uncertainty.",
+        "Only task-relevant files or state are read; Planner and Reviewer do not write project files as part of routine loop.",
+        "No project ZIP generation, ZIP upload, or mandatory attachment round-trip is required."
       ],
       "priority": 1,
       "passes": false
     },
     {
       "id": "DL-002",
-      "title": "Implement the fixed bounded state machine",
-      "description": "Route Planner, approval, execution, evidence, and Reviewer phases through explicit states and one automatic NEEDS_FIX budget.",
+      "title": "Validate the bounded workflow and human/DSH approvals",
+      "description": "Controller validates the structured Planner task, trusted target, workflow approval, execution trace and Reviewer decision; DSH tool permission approvals remain separate. Current state names are migration inputs, not proof of new-loop implementation.",
       "acceptanceCriteria": [
-        "Invalid transitions fail closed.",
-        "ACCEPTED, NEEDS_FIX, NEEDS_REPLAN, DEFER, and ESCALATE route deterministically.",
-        "A second automatic NEEDS_FIX cannot execute."
+        "Unapproved tasks do not reach the DSH executor; invalid outputs and transitions fail closed.",
+        "DSH native tool rejection is not bypassed by a local shell fallback or a ChatGPT connected-app write.",
+        "Unresolved NEEDS_REPLAN/NEEDS_FIX reauthorization policy is explicitly resolved before enabling automatic affected paths."
       ],
       "priority": 2,
       "passes": false
     },
     {
       "id": "DL-003",
-      "title": "Connect DSH Codex subscription execution",
-      "description": "Current default: the DSH Agent uses the installed dsh-codex-subscription `openai-codex` route with `gpt-6-luna`, `workspace-write` and native `approval: ask`. Only trusted host/profile configuration can override these defaults; task text cannot raise permissions. Historical first-phase requirements used `gpt-5.6-luna` and `danger-full-access` without approval; they have been superseded.",
+      "title": "Execute development only through the configured DSH Agent",
+      "description": "DSH Agent remains the routine executor using openai-codex / gpt-6-luna with host-chosen workspace-write and native approval: ask defaults. Evidence captures real native tool outcomes and test results.",
       "acceptanceCriteria": [
-        "The adapter uses the DSH Agent/LLM runtime rather than a second shell or ChatGPT execution plane.",
-        "Current default route/model is openai-codex / gpt-6-luna; native DSH workspace-write and approval: ask remain the default permission boundary.",
-        "The executor cwd is the configured product repository.",
-        "Executor output, cancellation, and failure become reportable evidence."
+        "Execution and tests use DSH Agent/tools in the trusted project root; task text cannot raise permission presets or replace projectRoot.",
+        "Native approval: ask and workspace-write are default boundaries; rejection and unavailable approvals fail closed.",
+        "No automatic product-repository commit, push, reset or clean occurs."
       ],
       "priority": 3,
       "passes": false
     },
     {
       "id": "DL-004",
-      "title": "Add Bridge attachment transport",
-      "description": "Extend DSH-Brain-Bridge CDP worker transport to select allowlisted local artifacts, wait for visible upload completion, send one prompt, and recover idempotently.",
+      "title": "Exchange plans and execution evidence without legacy ZIP transport",
+      "description": "ChatGPT Web Planner and Reviewer may inspect code directly via connected GitHub/Remote Desktop Commander apps and review correlated execution records. For M2, a human-mediated Web↔Controller/DSH handoff is allowed; Bridge app-invocation capability is unverified.",
       "acceptanceCriteria": [
-        "DOM.setFileInputFiles is used only after local manifest and hash validation.",
-        "The prompt is not sent while any attachment is uploading.",
-        "Retry, timeout, page refresh, and worker restart have explicit outcomes without duplicate submission."
+        "The handoff records run, task, scope, authorization and source identity without assuming DSH Bridge can call ChatGPT apps.",
+        "Reviewer checks relevant code, Git delta, DSH/Codex report and real test evidence before a structured decision.",
+        "No attachment-upload completion, DOM.setFileInputFiles requirement, or mandatory project ZIP is in the active acceptance path."
       ],
       "priority": 4,
       "passes": false
     },
     {
       "id": "DL-005",
-      "title": "Validate the deterministic first-phase loop",
-      "description": "Add fake Bridge, fake DSH Executor, CDP mock, and evidence tests; isolate any real smoke behind an explicit bounded command.",
+      "title": "Demonstrate a bounded real, evidence-driven M2 loop",
+      "description": "Perform one separately authorized live human-in-the-loop Planner -> approval -> DSH Agent -> Reviewer execution, with independently verified actual file and test outcomes; retain deterministic offline tests for regression.",
       "acceptanceCriteria": [
-        "Fixture marker round trips through Planner and Reviewer fake transport.",
-        "Report, diff, and latest project ZIP are attached in Reviewer order.",
-        "Default tests use no production account or Codex quota."
+        "One real approved run correlates Planner proposal, approval, DSH Agent session/tool evidence, Git baseline/delta, observed test command/result and Reviewer decision.",
+        "A successful M2 demo shows expected actual changes and passing scoped tests, validated ACCEPTED review and COMPLETE state; model report alone is insufficient.",
+        "No default production-account/paid smoke is run as part of deterministic regression tests; legacy ZIP/CDP tests do not count as new-loop acceptance."
       ],
       "priority": 5,
       "passes": false
