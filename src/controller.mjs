@@ -1567,6 +1567,11 @@ async function loadManualHandoffData(store, runId) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted state and manifest do not match runId')
   }
   if (!STATES.includes(state.state)) throw new DevLoopError('RUN_STATE_INVALID', `persisted run state is invalid: ${String(state.state)}`)
+  const manifestLagsActiveExecution = manifest.state === 'WAITING_FOR_APPROVAL'
+    && ['EXECUTING', 'COLLECTING_EVIDENCE', 'REVIEWING'].includes(state.state)
+  if (manifest.state !== state.state && !manifestLagsActiveExecution) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted run state is inconsistent with its manifest')
+  }
   if (!Array.isArray(manifest.artifacts)) throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted handoff manifest has no artifact list')
   const requestDescriptor = findArtifact(manifest, 'run-request.json')
   const planDescriptor = findArtifact(manifest, 'plan.json')

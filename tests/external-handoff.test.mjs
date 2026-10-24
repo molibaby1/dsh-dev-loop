@@ -163,6 +163,19 @@ test('session candidate lookup rejects unsafe run symlinks and damaged persisted
   )
 })
 
+test('session candidate lookup rejects an incompatible persisted manifest state', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const manifest = await fixture.store.readJson({ runId: submitted.runId, name: 'run-manifest.json' })
+  manifest.state = 'REVIEWING'
+  await fixture.store.writeJson({ runId: submitted.runId, stage: 'manifest', name: 'run-manifest.json', value: manifest })
+
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    error => error.code === 'RUN_RECORD_MISMATCH',
+  )
+})
+
 test('manual approval executes once, persists evidence for a new Controller, then accepts correlated review', async t => {
   const fixture = await createFixture(t)
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
