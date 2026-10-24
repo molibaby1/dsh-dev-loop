@@ -1,64 +1,64 @@
 {
   "project": "dsh-dev-loop",
-  "branchName": "main",
-  "description": "Bounded ChatGPT Web Planner -> authorized DSH Agent executor -> independent ChatGPT Web Reviewer loop; context is read through connected GitHub/Remote Desktop Commander apps and correlated execution evidence, not mandatory project ZIP or attachment uploads. Human-mediated handoff is acceptable for the first live M2 acceptance; automated app orchestration is not assumed.",
+  "branchName": "dev",
+  "description": "Single-user, single-routine-DSH-Agent, natural-language-first ChatGPT Web Planner -> explicit approval -> DSH Agent -> independent ChatGPT Web Reviewer loop. Internal structured validation and evidence are retained; manual JSON commands and project ZIP/Bridge attachments are not default user interaction. The actual cross-system handoff remains subject to live verification.",
   "userStories": [
     {
       "id": "DL-001",
-      "title": "Acquire scoped project context through connected tools",
-      "description": "Planner uses GitHub for the observed remote branch/commit and Remote Desktop Commander for necessary unpushed local state, with source/provenance recorded. Codex/DSH reports are supplementary evidence. No project ZIP transport is required.",
+      "title": "Initiate and authorize development using natural language",
+      "description": "One user describes a task and receives a scoped ChatGPT Web plan in ordinary language. The Controller validates a machine-readable representation internally; the user need not construct JSON, IDs, or hashes.",
       "acceptanceCriteria": [
-        "Planner records relevant repository, branch, observed commit and/or authorized local context source, including uncertainty.",
-        "Only task-relevant files or state are read; Planner and Reviewer do not write project files as part of routine loop.",
-        "No project ZIP generation, ZIP upload, or mandatory attachment round-trip is required."
+        "A normal task and workflow approval can be completed without the user manually composing protocol JSON, run IDs, or SHA-256 fields.",
+        "A proposed plan identifies scope, checks, and stop conditions before the user authorizes execution.",
+        "Missing or mismatched authorization cannot trigger DSH execution."
       ],
       "priority": 1,
       "passes": false
     },
     {
       "id": "DL-002",
-      "title": "Validate the bounded workflow and human/DSH approvals",
-      "description": "Controller validates the structured Planner task, trusted target, workflow approval, execution trace and Reviewer decision; DSH tool permission approvals remain separate. Current state names are migration inputs, not proof of new-loop implementation.",
+      "title": "Read relevant context without ZIPs or routine extra worktrees",
+      "description": "ChatGPT Web inspects pushed code by the designated GitHub dev ref and relevant unpushed state through an authorized local connection. The normal workflow uses one configured local workspace and one active branch rather than automatically creating per-task environments.",
       "acceptanceCriteria": [
-        "Unapproved tasks do not reach the DSH executor; invalid outputs and transitions fail closed.",
-        "DSH native tool rejection is not bypassed by a local shell fallback or a ChatGPT connected-app write.",
-        "Unresolved NEEDS_REPLAN/NEEDS_FIX reauthorization policy is explicitly resolved before enabling automatic affected paths."
+        "The Planner and Reviewer record actual repository, branch/commit, and relevant local context source or an explicit visibility limitation.",
+        "Normal task context transfer does not require generation, upload, or return of project ZIPs or Bridge attachment descriptors.",
+        "Routine tasks do not create another worktree, branch, or dependency installation unless isolation is justified and separately authorized."
       ],
       "priority": 2,
       "passes": false
     },
     {
       "id": "DL-003",
-      "title": "Execute development only through the configured DSH Agent",
-      "description": "DSH Agent remains the routine executor using openai-codex / gpt-6-luna with host-chosen workspace-write and native approval: ask defaults. Evidence captures real native tool outcomes and test results.",
+      "title": "Execute only through the configured DSH Agent and approvals",
+      "description": "DSH Agent is the sole routine development and test executor. Trusted Host configuration selects the project root, provider/model and native tool permissions. Model names describe current implementation, not permanent product obligations.",
       "acceptanceCriteria": [
-        "Execution and tests use DSH Agent/tools in the trusted project root; task text cannot raise permission presets or replace projectRoot.",
-        "Native approval: ask and workspace-write are default boundaries; rejection and unavailable approvals fail closed.",
-        "No automatic product-repository commit, push, reset or clean occurs."
+        "An approved task executes only via the DSH Agent and its configured tools in the trusted workspace.",
+        "DSH native workspace permissions and approval policy are independent of workflow plan approval; rejected or missing approval fails closed without shell or connector fallback.",
+        "No automatic commit, push, merge, reset, or clean occurs without separate express authorization."
       ],
       "priority": 3,
       "passes": false
     },
     {
       "id": "DL-004",
-      "title": "Exchange plans and execution evidence without legacy ZIP transport",
-      "description": "ChatGPT Web Planner and Reviewer may inspect code directly via connected GitHub/Remote Desktop Commander apps and review correlated execution records. For M2, a human-mediated Web↔Controller/DSH handoff is allowed; Bridge app-invocation capability is unverified.",
+      "title": "Return auditable evidence and independent review without user-written JSON",
+      "description": "Controller keeps run/approval/evidence linkage in internal structured records while ChatGPT Web independently checks actual Git delta, DSH tool/test results and project state. Non-accepted conclusions do not automatically rerun.",
       "acceptanceCriteria": [
-        "The handoff records run, task, scope, authorization and source identity without assuming DSH Bridge can call ChatGPT apps.",
-        "Reviewer checks relevant code, Git delta, DSH/Codex report and real test evidence before a structured decision.",
-        "No attachment-upload completion, DOM.setFileInputFiles requirement, or mandatory project ZIP is in the active acceptance path."
+        "Relevant actual files, diff, DSH tool approval outcomes, test command/results, and execution finalization are bound to the run and available for independent review.",
+        "Tampered, mismatched, stale or incomplete evidence is rejected; the Reviewer cannot claim completion from model report alone.",
+        "User-facing review and follow-up are ordinary-language summaries; any internal JSON contract is generated or consumed by tooling rather than typed by the user."
       ],
       "priority": 4,
       "passes": false
     },
     {
       "id": "DL-005",
-      "title": "Demonstrate a bounded real, evidence-driven M2 loop",
-      "description": "Perform one separately authorized live human-in-the-loop Planner -> approval -> DSH Agent -> Reviewer execution, with independently verified actual file and test outcomes; retain deterministic offline tests for regression.",
+      "title": "Verify a real small end-to-end natural-language development loop",
+      "description": "With separate explicit authorization, run one real bounded ChatGPT Web planning, approval, DSH Agent development and testing, and ChatGPT Web independent review on a controlled project. Do not infer automatic app handoff capability from connector availability.",
       "acceptanceCriteria": [
-        "One real approved run correlates Planner proposal, approval, DSH Agent session/tool evidence, Git baseline/delta, observed test command/result and Reviewer decision.",
-        "A successful M2 demo shows expected actual changes and passing scoped tests, validated ACCEPTED review and COMPLETE state; model report alone is insufficient.",
-        "No default production-account/paid smoke is run as part of deterministic regression tests; legacy ZIP/CDP tests do not count as new-loop acceptance."
+        "One separately authorized real run records plan approval, actual DSH Agent tool and test evidence, Git changes, Reviewer verification and a correlated terminal outcome.",
+        "The user completes the normal interaction without constructing JSON or ZIPs; any still-human-mediated cross-system handoff is clearly identified and evaluated rather than silently called automated.",
+        "Deterministic offline tests or unverified model reports alone do not count as completion of real M2 acceptance."
       ],
       "priority": 5,
       "passes": false

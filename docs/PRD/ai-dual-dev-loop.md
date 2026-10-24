@@ -1,117 +1,107 @@
-# AI Dual-Layer Development Loop — Current Product Scope
+# AI Dual-Layer Development Loop — 产品需求（修订草案）
 
-> 2026-10-24 product-direction revision. This document defines the **intended new loop**, not a claim that the existing `dev` runtime already implements it. The previous ZIP/attachment-first Phase 1 design is historical.
+> 修订日期：2026-10-24。本文定义目标产品行为，**不表示当前 `dev` 已实现**。正式生效以文档合并及相应决策记录为准。历史 ZIP/Bridge 设计和 M2-A 人工 JSON 入口均不是最终用户体验。
 
-## Background and problem
+## 1. 背景与用户问题
 
-The old first-phase workflow packaged the project into a ZIP and uploaded it through DSH-Brain-Bridge for Planner and Reviewer. That transfer model is **not part of the new development loop**. In ChatGPT Web, the user has connected GitHub (remote repository access) and Remote Desktop Commander (authorized local project access); Codex/DSH execution reports provide another source of execution context. The objective is to use these sources selectively, without bulk-uploading the project.
+本项目现阶段由一位开发者使用：ChatGPT Web 在一条对话中负责规划与独立复审，一个 DSH Agent 承担常规代码执行。用户希望直接用自然语言提出任务，由模型理解目标、建议下一步；不希望日常手工打包 ZIP、复制协议 JSON、为每个任务新建分支/worktree 或重新安装依赖。
 
-The production boundary remains: DeepSeek Harness (DSH) is the development execution and permission authority. ChatGPT Web plans and independently reviews, and the Controller validates tasks, approvals, state and audit evidence. A connected ChatGPT app being usable interactively **does not prove** DSH-Brain-Bridge can trigger that app or obtain its data automatically.
+历史实现分两条：`/dev-loop` 接受自然语言，但底层仍依赖项目 ZIP、DSH-Brain-Bridge 附件传输；本地 M2-A 的 `/dev-loop-m2` 消除了强制 ZIP/Bridge，却要求手工提交结构化 JSON。两者均未构成目标闭环。
 
-## Goals
+## 2. 产品目标
 
-Deliver one bounded, human-authorized development loop:
+1. **自然语言优先**：用户描述问题、讨论方案、批准、询问状态和接收复审结论，默认都使用普通语言；用户不必拼写 run ID、哈希或 JSON。
+2. **一个常规执行主体**：ChatGPT Web Planner / Reviewer 进行有依据的判断与只读核查；DSH Agent 是常规开发和测试的唯一执行主体；Controller 只管理可信交接、批准、状态与证据。
+3. **固定日常工作区**：本项目默认针对 `molibaby1/dsh-dev-loop` 的 `dev` 分支及配置的一个本地工作目录开展串行开发。只有存在明确隔离风险或用户另行授权时才启用其他分支/worktree；已有历史工作区不因本要求自动删除。
+4. **无需归档传输**：ChatGPT Web 按需通过已连接 GitHub 读取已推送代码，通过 Remote Desktop Commander 读取必要的未推送状态；参考相关 DSH/Codex 报告。不再要求项目 ZIP、附件上传/返回。
+5. **可验证、可恢复的受控闭环**：方案明确且被批准后执行；记录实际工具审批、代码差异和测试结果；Reviewer 独立核验并给出结论。证据或权限不足时停止，而非猜测成功。
 
-1. ChatGPT Web Planner obtains only task-relevant context from the remote repository through GitHub, from unpushed local files through Remote Desktop Commander when needed, and from available execution reports. It identifies the exact source/ref and uncertainty.
-2. Planner produces a scoped, structured task proposal with intended changes, acceptance checks, allowed paths and stop conditions; Controller validates the proposal.
-3. A human authorizes the workflow plan before execution. This is separate from each applicable DSH native tool approval.
-4. **DSH Agent is the sole routine development executor**, using its host-configured tools, project root, execution route and permission policy. The ChatGPT Web Planner/Reviewer do not modify project files as part of their routine roles.
-5. The run captures DSH execution/tool outcomes, actual project changes, Git state/diff, test results and an execution report, with source and run correlation.
-6. ChatGPT Web Reviewer reads the report and independently checks relevant source files, Git state and available test evidence using the connected apps; it returns a structured review decision.
-7. Controller validates and records that decision, the approval chain and evidence, then completes, waits or stops according to the approved state contract.
+## 3. 非目标
 
-The initial M2 acceptance target is **one real, bounded, human-in-the-loop run**. Automated ChatGPT-app invocation, cross-system unattended scheduling and fully automatic handoff are not assumed to be available.
+- 多用户、多执行 Agent 并行调度、复杂队列或任务管理平台。
+- 为每项任务自动创建分支、worktree、独立依赖环境或 Draft PR。
+- 恢复旧 DSH-Brain-Bridge 项目 ZIP/CDP 附件上传作为主流程。
+- 要求用户直接输入结构化 JSON、复制 SHA-256 或手工拼接协议报文。
+- 假定 ChatGPT Web 插件能够被 DSH/Bridge 自动调用，或未经验证承诺跨系统全自动交接。
+- 默认自动提交/推送/合并、重置/清理项目文件，或通过 ChatGPT 插件形成另一条常规代码执行链。
+- 随本次 PRD 修订变更 DSH 核心、实现代码、现有权限默认值或历史运行数据。
 
-## Roles and boundaries
+## 4. 用户交互及角色规则
 
-| Role | May do in the new loop | Must not do by default |
-| --- | --- | --- |
-| ChatGPT Web Planner | Read relevant remote/local context; explain scope; propose structured plan | Mutate local or remote project files; silently approve execution |
-| ChatGPT Web Reviewer | Read DSH/Codex report; independently check relevant code, diff and test evidence; provide decision | Fix code as a side effect of review; accept an unverified self-report as proof |
-| Controller | Validate structured proposals/decisions, trusted target, authorization and evidence; manage state | Execute arbitrary shell commands, silently raise DSH permissions, commit/push/reset/clean a product project |
-| DSH Agent | Execute approved work and tests through DSH native tools and approvals | Change targets outside the trusted workspace or bypass tool approval |
-| GitHub and Remote Desktop Commander | Supply scoped context/evidence to ChatGPT Web through user-connected app access | Become an implicit second developer/executor or automatic publish path |
+**用户**：用自然语言提出目标，并对需要执行的方案作明确批准；如出现需要扩大范围、发布或具有破坏性风险的操作，另行授权。
 
-The apps may technically support writes. **Technical ability is not workflow authorization**. A separate explicit request for a direct edit/publish is outside the routine Planner/Reviewer path and must be assessed independently.
+**ChatGPT Web Planner**：先依据当前有效的产品约束了解任务，核对实际仓库/分支/commit 和必要的本地差异，说明拟改动、边界、验证方法及风险。模型可以建议下一步，但建议本身不授予执行权限。不可把未检查的报告当作代码真相。
 
-### Source selection and currency
+**Controller**：将自然语言对话形成的任务映射为经过校验的内部方案/状态，锁定可信项目根目录、批准对象与证据关联。审批是单独的操作，不得因为模型文本里包含“同意”或内嵌字段就跳过校验；异常输入、旧证据或竞争状态按既定安全边界拒绝。
 
-- For already-pushed code, read the requested GitHub repository, branch and **observed commit**; never silently switch to the default branch. The currently designated project code source is `molibaby1/dsh-dev-loop`, `dev`.
-- For relevant unpushed changes, access the explicitly authorized local workspace through Remote Desktop Commander using the minimum necessary read-only operations; do not reread a pushed copy locally without need.
-- Execution reports are evidence inputs, not the code truth. Independently verify claims of completion, changed files and test results using observable sources.
-- Distinguish DSH Agent session/tool evidence from a separate Codex run report. Do not assume they describe the same run unless identifiers and outputs correlate.
-- Record unavailable sources and consistency limits. Never infer that a remote commit contains local unpushed work.
+**DSH Agent**：接收经验证且已批准的任务，使用 Host 配置的工具、项目根目录和原生权限完成代码与测试操作。常规执行时不额外启动独立代码 Agent，也不用宿主任意 shell 作为工具审批的后备路径。
 
-## Execution authority and approval
+**ChatGPT Web Reviewer**：查看真实变更、Git 状态、测试与 DSH 工具结果，独立判断是否满足批准的范围与验收标准；输出便于用户理解的结论。是否完成不能仅依赖执行 Agent 的自述。
 
-The DSH Agent's current default is `openai-codex` / `gpt-6-luna`, with `workspace-write` and DSH native `approval: ask`, subject only to trusted host/profile overrides. Historical `gpt-5.6-luna` and `danger-full-access` defaults remain superseded.
+### 4.1 工作区与代码真源
 
-Workflow plan approval (for example, `/dev-loop approve`) and native DSH tool approval are **two separate grants**. Tool rejection or an unavailable approval channel must fail closed. The Controller and ChatGPT model output cannot choose a higher permission preset, move the trusted project root, or execute a host-shell fallback. Product-repository Git operations are read-only for evidence; no automatic commit, merge, push, reset or clean.
+- 当前项目的代码真源是 `molibaby1/dsh-dev-loop` 的 `dev` 分支；指定 commit 必须按实际读取结果记录，不默认使用 GitHub 仓库的其他默认分支。
+- 本项目的日常开发在一个 Host 配置的本地工作目录中完成；`dev` 是当前默认工作分支，**不是**让任务文本能指定任意项目根目录。
+- 发生未提交变更时先核对并保护；可以在授权下保存到 Git 历史，禁止以“脏工作区”为由自动 reset/clean。
+- 针对其他项目的开发请求仍由可信 Host 配置选定目标，不能直接将本项目的绝对路径硬编码为通用协议。
 
-## Interaction and evidence contract
+### 4.2 自然语言与内部结构化数据
 
-The contract is about observable data and boundaries, **not a project-archive transport**:
+- **用户接口**用普通语言表达需求、批准、取消、查询和复审，不把 JSON 当成日常用户界面。
+- **内部数据**仍可使用 JSON/Schema、run ID、方案与证据哈希、状态和审计记录。这些用于机器校验与回放，**不是**必须由用户手工提供的跨系统消息格式。
+- 模型负责理解和建议，确定性校验负责是否获批、项目路径、权限、证据新鲜度与可接受的状态转换；不得仅凭模型自信程度绕过校验。
+- 初始 M2 阶段可以由人协助 Web 与 DSH 交接，但需要提供低负担、可核验的实际路径。若仍必须人工复制 JSON/哈希，应视为过渡性技术入口，而非满足本用户体验目标。自动插件交接能力尚待实测，不得虚构。
 
-- **Planner input:** human problem statement, task-relevant file/code references, current branch/commit and relevant local working-tree state, plus material constraints. Context may be read interactively via connected apps. No `project.zip` requirement.
-- **Planner output:** structured proposal with the intended executor task, allowed files/scope, validation steps and stop conditions, checked before execution. A plan or user message may not override trusted Host configuration.
-- **Execution input:** validated, explicitly authorized task passed to the DSH Agent by a verified handoff; native tool approvals still apply.
-- **Evidence output:** correlated DSH Agent/tool records, execution report, Git baseline and delta, test command and observed result, relevant project state, and failures/uncertainty. Tests and repository inspection remain governed by the established permission and read-only boundaries.
-- **Reviewer input:** evidence plus direct, scoped access to applicable source-of-truth code through ChatGPT Web connected apps. No mandatory ZIP, attachment-upload or file-return protocol.
-- **Reviewer output:** one validated structured decision: `ACCEPTED`, `NEEDS_FIX`, `NEEDS_REPLAN`, `DEFER` or `ESCALATE`, with summary and findings. It is not executable code.
-- **Audit:** run ID, context refs, plan and approval, execution identity/results, actual changed files, test evidence, reviewer decision and terminal outcome must be reconstructable. Existing JSON/Markdown artifacts may be retained internally; internal persistence does not imply ChatGPT upload.
+### 4.3 权限、失败和停止条件
 
-The existing `run-manifest.json`, `problem-package.json`, `plan.json`, `approval.json`, `executor-report.md`, `git-diff.patch`, `test-result.json`, `review.json` and `audit-trace.json` remain useful evidence artifacts. `project.zip` and Bridge attachment descriptors are **legacy transport artifacts, not mandatory new-loop inputs, outputs or acceptance criteria**.
+- 当前代码观察值：默认路由/模型为 `openai-codex` / `gpt-6-luna`，默认权限 `workspace-write`，DSH 原生审批 `approval: ask`。**具体模型标识属于 Host 配置和实现事实，不是永久产品验收条件。**
+- 工作流方案批准与 DSH 工具批准是两道不同的授权。工具拒绝或不可用时不得绕过。
+- 方案变化、上下文变化、执行越界、证据损坏/错配、测试证据不可信时不得宣布完成；非 `ACCEPTED` 结果不自动重执行。需要重新规划或超出原批准范围的修复须重新取得明确授权。
+- 是否允许在**完全不扩大批准范围**时有限自动修复，以及一般情况下测试失败是否必然阻止 `COMPLETE`，仍属未定正式语义；在决定前采取停止、报告、重新授权的保守做法，不偷偷沿用旧状态机自动路径。
+- 默认不自动 Git commit/push/merge/reset/clean。针对这些操作的单独明确授权不等于授权修改 DSH 工具审批或扩大执行范围。
 
-Existing Controller state names and Reviewer decisions remain a migration baseline, **not automatic proof of new-loop semantics**. In particular, renewed authorization after `NEEDS_REPLAN`, authorization scope for `NEEDS_FIX`, and any universal rule about test failure preventing `COMPLETE` require explicit contract decisions; the current code must not silently decide these questions.
+## 5. 用户故事及验收条件
 
-## User stories and acceptance criteria
+### US-1：自然语言发起与确认开发
 
-### US-1: Task-relevant context without project upload
+作为唯一的日常开发用户，我希望直接描述问题并收到清楚的实施建议，而不用编写协议 JSON。
 
-As the user, I want Planner to inspect the relevant GitHub files and, if necessary, unpushed local files, rather than require me to package the project.
+验收：能从自然语言任务得到范围、验收点和风险说明；未经独立批准，DSH 不执行开发；用户不需要手工创建结构化方案、run ID 或哈希。
 
-Acceptance: it identifies the actual repository/ref or local source used; retrieves enough context for the bounded task; does not require, generate for transfer, or upload `project.zip`; does not make unauthorized writes.
+### US-2：直接读取真实代码上下文
 
-### US-2: Approved DSH development execution
+作为用户，我希望 Planner/Reviewer 查看实际相关代码，不必上传压缩包或维护多份项目副本。
 
-As the user, I want the approved task performed by DSH Agent under its native permissions.
+验收：标明实际 GitHub 仓库、`dev` ref/commit 和必要的本地来源；能发现不一致或无法核对的状态；主流程不产生/上传项目 ZIP，正常任务不强制创建 worktree。
 
-Acceptance: the plan/scope and a separate workflow authorization are recorded; the DSH Agent runs inside the trusted project root using configured provider/model and `workspace-write` / `approval: ask` defaults; missing/rejected native tool approval cannot be replaced by shell execution or a ChatGPT-app write.
+### US-3：一个 DSH Agent 按可信授权执行
 
-### US-3: Independent evidence-driven review
+作为用户，我希望批准后由单一常规执行 Agent 使用原生工具修改、测试并提供证据。
 
-As the user, I want ChatGPT Web Reviewer to check what really changed, not only repeat the developer's report.
+验收：可信 Host 根目录和权限不被用户消息或模型输出覆盖；原生审批拒绝后没有越权后备执行；执行记录关联被批准任务、实际变更和测试命令/结果。
 
-Acceptance: Reviewer receives or accesses a correlated execution report, observed Git delta and test evidence; checks pertinent source through its connected apps; returns a validated structured decision; no ZIP/attachment round-trip is needed.
+### US-4：独立复审与安全恢复
 
-### US-4: Auditable human-in-the-loop completion
+作为用户，我希望 ChatGPT Web 核对真正的执行结果，并知道下一步是否需要我决定。
 
-As the user, I want one real, bounded development run whose result can be independently verified.
+验收：Reviewer 将报告与 Git 差异、测试及现有项目状态交叉检查；证据损坏、过期、范围外改动或执行未结算时拒绝 `ACCEPTED`；非接受结果不自动重复运行；运行与决定可追溯。
 
-Acceptance: all phases and actual file/test outcomes are correlated by run; the Controller retains the decision/authorization trace; no unauthorized changes or automatic push occur; a successful demo ends with verified task behavior, the expected files/diff, passing scoped tests and `ACCEPTED` / `COMPLETE`. Mock-only tests are insufficient for M2 acceptance.
+### US-5：一次真实、低负担的闭环
 
-## Non-goals
+作为用户，我希望通过一项小的真实任务验证 Planner → 授权 → DSH Agent → Reviewer 全程可用。
 
-- Project ZIP generation/upload/return as a requirement of the active loop; resurrection of legacy CDP attachment upload criteria.
-- ChatGPT Web Planner/Reviewer as routine code-writing agents, or an independent ChatGPT shell execution plane.
-- Automatic Git commits/pushes or destructive cleanup of product repositories.
-- DSH core changes, multi-project scheduling, unlimited retries, unattended cross-app orchestration, or a new management platform.
-- Treating external reports, synthetic tests or documentation updates as proof of real end-to-end acceptance.
+验收：在单独许可的真实测试中看到真实 Agent 的工具批准、文件差异和测试结果，Reviewer 独立校验后才记录成功；用户无需手工编写 JSON；离线模拟测试不能替代真实 M2 验收。
 
-## Migration status and unresolved decisions
+## 6. 当前实现与迁移状态（不是产品承诺）
 
-The `dev` implementation still calls `createProjectZip()` in `src/controller.mjs` and requires attachments in `src/bridge-client.mjs`. Its Bridge worker remains an attachment-oriented transport. Those are **legacy implementation dependencies requiring adaptation**, not new-loop product requirements. Existing M1/B2f tests substantiate the DSH permission boundary but do not establish M2 acceptance.
+- `dev` 当前 `/dev-loop` **表面支持自然语言**，但 Controller / preflight / Bridge 仍依赖 ZIP 和附件通道；不能作为新产品的验收路径。
+- 本地独立提交 `b4eec3498b55bdea9e19afafe31b1ac22c1ac1b8`（M2-A）实现无 ZIP 的人工交接、审批、证据和安全拒绝；独立离线复验 133/133 通过。但 `/dev-loop-m2` 仍要求人工 JSON，未合入 `dev`，也没有真实 Agent 端到端验收。
+- 已存在的权限、审计、取证安全能力应优先复用；是否简化 M2-A 入口/状态实现，待依据本 PRD 单独确定最小代码修改范围。
 
-Before a real M2 run, verify/design the minimum **ChatGPT Web ↔ Controller/DSH task handoff and return-of-evidence** that works with connected apps. Merely having GitHub and Remote Desktop Commander in ChatGPT Web does not make their tools available to a DSH-side Bridge request. A bounded human-mediated handoff is acceptable initially, if scope, authorization, provenance and run identity are preserved. Do not invent a new automated bridge protocol without observable evidence.
+## 7. 尚待确认的产品/接入问题
 
-Open decisions to resolve before enabling the affected behavior:
-1. Whether `NEEDS_REPLAN` (or an out-of-scope `NEEDS_FIX`) always requires renewed workflow approval.
-2. The minimal validated handoff/return protocol and what records it preserves across a manual Web↔DSH transfer.
-3. The use of `branchName: "main"` in the existing machine-readable PRD; this legacy field must not silently override the designated `dev` code branch.
-4. General test-failure-to-`COMPLETE` semantics and exact evidence snapshot binding (defer to M3 unless demonstrably blocking a bounded M2 test).
+1. **真实交接能力**：ChatGPT Web 插件和 DSH 之间是否存在实际可用、经过授权的自动/半自动任务与复审结果通道；在证实之前允许人工介入，但不承诺最终无人工转交。
+2. **有限自动修复**：已批准范围内是否可以无再次人工确认地自动执行一次 `NEEDS_FIX`。当前 M2-A 保守地停止，待独立决策。
+3. **全局完成判定**：非本次 M2 最小验收场景下，测试失败与 `COMPLETE` 的统一规则及最终状态快照绑定，留待后续明确 Contract。
 
-## Risks and rollback
-
-Uncertain app connectivity, stale local-vs-remote state, incomplete Agent session evidence and unauthorized extra writes must fail closed or stop for human action. When cancelling or failing, preserve existing product changes for inspection; never reset or clean them automatically. Revert only the Controller's own optional adapter/configuration after confirming ownership and scope.
-
-A **real** Planner/Reviewer/DSH test remains separately opt-in and bounded. This PRD revision does not authorize ChatGPT Web messages, model consumption, DSH Agent execution, local writes or product-repository publishing.
+以上待确认项不得以旧代码/测试行为代替产品决策，也不得阻塞保留已验证的离线安全能力。
