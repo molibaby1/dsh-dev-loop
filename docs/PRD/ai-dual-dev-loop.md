@@ -1,97 +1,107 @@
-# AI Dual-Layer Development Loop — Phase 1
+# AI Dual-Layer Development Loop — 产品需求
 
-## Background
+> 修订日期：2026-10-24。本文定义目标产品行为，**不表示当前 `dev` 已实现**。规范何时成为 `dev` 的有效基线，以该分支实际纳入的提交和项目决策记录为准。历史 ZIP/Bridge 设计和 M2-A 人工 JSON 入口均不是最终用户体验。
 
-This repository owns a small development-loop Controller for a separate product repository. DeepSeek Harness remains the execution runtime and permission authority. `dsh-codex-subscription` provides the `openai-codex` route and `gpt-6-luna` model inside DSH. DSH-Brain-Bridge provides ChatGPT Web reasoning transport for Planner and Reviewer.
+## 1. 背景与用户问题
 
-## Goal
+本项目现阶段由一位开发者使用：ChatGPT Web 在一条对话中负责规划与独立复审，一个 DSH Agent 承担常规代码执行。用户希望直接用自然语言提出任务，由模型理解目标、建议下一步；不希望日常手工打包 ZIP、复制协议 JSON、为每个任务新建分支/worktree 或重新安装依赖。
 
-Implement one bounded, evidence-driven run:
+历史实现分两条：`/dev-loop` 接受自然语言，但底层仍依赖项目 ZIP、DSH-Brain-Bridge 附件传输；本地 M2-A 的 `/dev-loop-m2` 消除了强制 ZIP/Bridge，却要求手工提交结构化 JSON。两者均未构成目标闭环。
 
-1. Package a small project artifact.
-2. Send a Planner request with the artifact through the Bridge attachment transport.
-3. Validate the Planner plan and authorize it automatically for the Web command (or wait for explicit approval when `autoApprove: false`).
-4. Execute the authorized task through a DSH Agent using `openai-codex` / `gpt-6-luna`.
-5. Collect report, diff, test result, and a fresh project artifact.
-6. Send those artifacts to a Reviewer through the Bridge attachment transport.
-7. Route one structured decision to `COMPLETE`, `EXECUTING`, `ANALYZING`, `WAITING`, or `STOPPED`.
+## 2. 产品目标
 
-## Non-goals
+1. **自然语言优先**：用户描述问题、讨论方案、批准、询问状态和接收复审结论，默认都使用普通语言；用户不必拼写 run ID、哈希或 JSON。
+2. **一个常规执行主体**：ChatGPT Web Planner / Reviewer 进行有依据的判断与只读核查；DSH Agent 是常规开发和测试的唯一执行主体；Controller 只管理可信交接、批准、状态与证据。
+3. **固定日常工作区**：本项目默认针对 `molibaby1/dsh-dev-loop` 的 `dev` 分支及配置的一个本地工作目录开展串行开发。只有存在明确隔离风险或用户另行授权时才启用其他分支/worktree；已有历史工作区不因本要求自动删除。
+4. **无需归档传输**：ChatGPT Web 按需通过已连接 GitHub 读取已推送代码，通过 Remote Desktop Commander 读取必要的未推送状态；参考相关 DSH/Codex 报告。不再要求项目 ZIP、附件上传/返回。
+5. **可验证、可恢复的受控闭环**：方案明确且被批准后执行；记录实际工具审批、代码差异和测试结果；Reviewer 独立核验并给出结论。证据或权限不足时停止，而非猜测成功。
 
-- No changes to the product repository from this Controller implementation.
-- No DSH core changes.
-- No automatic commit, merge, or push.
-- No Workspace MCP restoration.
-- No ChatGPT-native Shell, Search, Apps, or file execution plane.
-- No unbounded retry loop, multi-project scheduling, management UI, or workflow engine.
-- No default real-account smoke test.
+## 3. 非目标
 
-## Authority boundaries
+- 多用户、多执行 Agent 并行调度、复杂队列或任务管理平台。
+- 为每项任务自动创建分支、worktree、独立依赖环境或 Draft PR。
+- 恢复旧 DSH-Brain-Bridge 项目 ZIP/CDP 附件上传作为主流程。
+- 要求用户直接输入结构化 JSON、复制 SHA-256 或手工拼接协议报文。
+- 假定 ChatGPT Web 插件能够被 DSH/Bridge 自动调用，或未经验证承诺跨系统全自动交接。
+- 默认自动提交/推送/合并、重置/清理项目文件，或通过 ChatGPT 插件形成另一条常规代码执行链。
+- 随本次 PRD 修订变更 DSH 核心、实现代码、现有权限默认值或历史运行数据。
 
-- Planner and Reviewer may return data only.
-- Controller validates all Planner and Reviewer data before use.
-- Executor changes the product only through the DSH Agent and its configured tools.
-- All evidence collection uses an explicit DSH execution seam or a read-only local adapter with allowlisted commands.
-- Local artifact paths remain inside Controller, Gateway, and Browser Worker protocol; they are never sent to ChatGPT.
+## 4. 用户交互及角色规则
 
-## Current Executor permission default
+**用户**：用自然语言提出目标，并对需要执行的方案作明确批准；如出现需要扩大范围、发布或具有破坏性风险的操作，另行授权。
 
-The original first-phase model `gpt-5.6-luna` is historical. The current Executor defaults to `openai-codex` / `gpt-6-luna` (subject to trusted host configuration).
+**ChatGPT Web Planner**：先依据当前有效的产品约束了解任务，核对实际仓库/分支/commit 和必要的本地差异，说明拟改动、边界、验证方法及风险。模型可以建议下一步，但建议本身不授予执行权限。不可把未检查的报告当作代码真相。
 
-The original PRD's `danger-full-access` permission requirement is historical and is superseded by the DSH 0.2.1-rc.2 compatibility change: Executor defaults to `workspace-write` with DSH's native `approval: ask` policy. Only trusted host/profile configuration can select a higher preset; task text and model output cannot change it. `/dev-loop approve` authorizes the workflow plan and is separate from approval of DSH tool execution.
+**Controller**：将自然语言对话形成的任务映射为经过校验的内部方案/状态，锁定可信项目根目录、批准对象与证据关联。审批是单独的操作，不得因为模型文本里包含“同意”或内嵌字段就跳过校验；异常输入、旧证据或竞争状态按既定安全边界拒绝。
 
-## State machine
+**DSH Agent**：接收经验证且已批准的任务，使用 Host 配置的工具、项目根目录和原生权限完成代码与测试操作。常规执行时不额外启动独立代码 Agent，也不用宿主任意 shell 作为工具审批的后备路径。
 
-```text
-IDLE
-  -> ANALYZING
-  -> PLAN_READY
-  -> EXECUTING (Web command auto-approval)
-  -> WAITING_FOR_APPROVAL (when autoApprove is false)
-  -> COLLECTING_EVIDENCE
-  -> REVIEWING
+**ChatGPT Web Reviewer**：查看真实变更、Git 状态、测试与 DSH 工具结果，独立判断是否满足批准的范围与验收标准；输出便于用户理解的结论。是否完成不能仅依赖执行 Agent 的自述。
 
-ACCEPTED      -> COMPLETE
-NEEDS_FIX     -> EXECUTING (at most once)
-NEEDS_REPLAN  -> ANALYZING
-DEFER         -> WAITING_FOR_APPROVAL
-ESCALATE      -> STOPPED
-```
+### 4.1 工作区与代码真源
 
-## Artifact contract
+- 当前项目的代码真源是 `molibaby1/dsh-dev-loop` 的 `dev` 分支；指定 commit 必须按实际读取结果记录，不默认使用 GitHub 仓库的其他默认分支。
+- 本项目的日常开发在一个 Host 配置的本地工作目录中完成；`dev` 是当前默认工作分支，**不是**让任务文本能指定任意项目根目录。
+- 发生未提交变更时先核对并保护；可以在授权下保存到 Git 历史，禁止以“脏工作区”为由自动 reset/clean。
+- 针对其他项目的开发请求仍由可信 Host 配置选定目标，不能直接将本项目的绝对路径硬编码为通用协议。
 
-Every artifact descriptor includes `id`, `runId`, `stage`, `name`, `mime`, `bytes`, `sha256`, and `source`. The first phase uses:
+### 4.2 自然语言与内部结构化数据
 
-- `run-manifest.json`
-- `problem-package.json`
-- `plan.json`
-- `approval.json`
-- `project.zip`
-- `executor-report.md`
-- `git-diff.patch`
-- `test-result.json`
-- `review.json`
-- `audit-trace.json`
+- **用户接口**用普通语言表达需求、批准、取消、查询和复审，不把 JSON 当成日常用户界面。
+- **内部数据**仍可使用 JSON/Schema、run ID、方案与证据哈希、状态和审计记录。这些用于机器校验与回放，**不是**必须由用户手工提供的跨系统消息格式。
+- 模型负责理解和建议，确定性校验负责是否获批、项目路径、权限、证据新鲜度与可接受的状态转换；不得仅凭模型自信程度绕过校验。
+- 初始 M2 阶段可以由人协助 Web 与 DSH 交接，但需要提供低负担、可核验的实际路径。若仍必须人工复制 JSON/哈希，应视为过渡性技术入口，而非满足本用户体验目标。自动插件交接能力尚待实测，不得虚构。
 
-The Controller enforces a configured artifact root, canonical paths, symlink containment, byte limits, SHA-256 verification, idempotency keys, upload timeouts, and cleanup of temporary files.
+### 4.3 权限、失败和停止条件
 
-## Product repository handling
+- 当前代码观察值：默认路由/模型为 `openai-codex` / `gpt-6-luna`，默认权限 `workspace-write`，DSH 原生审批 `approval: ask`。**具体模型标识属于 Host 配置和实现事实，不是永久产品验收条件。**
+- 工作流方案批准与 DSH 工具批准是两道不同的授权。工具拒绝或不可用时不得绕过。
+- 方案变化、上下文变化、执行越界、证据损坏/错配、测试证据不可信时不得宣布完成；非 `ACCEPTED` 结果不自动重执行。需要重新规划或超出原批准范围的修复须重新取得明确授权。
+- 是否允许在**完全不扩大批准范围**时有限自动修复，以及一般情况下测试失败是否必然阻止 `COMPLETE`，仍属未定正式语义；在决定前采取停止、报告、重新授权的保守做法，不偷偷沿用旧状态机自动路径。
+- 默认不自动 Git commit/push/merge/reset/clean。针对这些操作的单独明确授权不等于授权修改 DSH 工具审批或扩大执行范围。
 
-The Controller targets a configured repository root and never resets or cleans it. It records the baseline commit, status, and diff before execution. Existing dirty work is evidence, not permission to discard or overwrite. The existing packaging exclusion rules are treated as input; generated run artifacts are written outside the product tree.
+## 5. 用户故事及验收条件
 
-## Acceptance criteria
+### US-1：自然语言发起与确认开发
 
-- A fixture project ZIP is generated with a stable manifest and hash.
-- Attachment submission does not send the Planner or Reviewer prompt until all attachments visibly reach the completed state in ChatGPT Web.
-- A fixture marker in the ZIP is returned by the fake Bridge test worker.
-- `report.md` and `diff.patch` can be uploaded in the same request.
-- Failed, timed-out, refreshed, and restarted attachment requests have explicit failure or recovery outcomes.
-- Retrying the same request does not create duplicate submission.
-- ChatGPT output is consumed as validated data and never executed directly.
-- The Executor route is `openai-codex` with model `gpt-6-luna`. The original permission mapping (`danger-full-access` with no approval prompt) is a historical requirement superseded by the current Executor permission default above.
-- One `NEEDS_FIX` is allowed; a second automatic fix is rejected and stops the run.
-- Deterministic tests do not require a production ChatGPT account or paid Codex call.
+作为唯一的日常开发用户，我希望直接描述问题并收到清楚的实施建议，而不用编写协议 JSON。
 
-## Risks and rollback
+验收：能从自然语言任务得到范围、验收点和风险说明；未经独立批准，DSH 不执行开发；用户不需要手工创建结构化方案、run ID 或哈希。
 
-The ChatGPT Web DOM and upload states are unstable. CDP selectors and completion detection remain isolated in the Bridge worker and fail closed. A real smoke is opt-in, bounded, and stops after one Planner or Reviewer request. The Controller can be rolled back by removing its plugin/CLI entry and deleting only its own run artifact root; it never repairs the product repository by reset or clean.
+### US-2：直接读取真实代码上下文
+
+作为用户，我希望 Planner/Reviewer 查看实际相关代码，不必上传压缩包或维护多份项目副本。
+
+验收：标明实际 GitHub 仓库、`dev` ref/commit 和必要的本地来源；能发现不一致或无法核对的状态；主流程不产生/上传项目 ZIP，正常任务不强制创建 worktree。
+
+### US-3：一个 DSH Agent 按可信授权执行
+
+作为用户，我希望批准后由单一常规执行 Agent 使用原生工具修改、测试并提供证据。
+
+验收：可信 Host 根目录和权限不被用户消息或模型输出覆盖；原生审批拒绝后没有越权后备执行；执行记录关联被批准任务、实际变更和测试命令/结果。
+
+### US-4：独立复审与安全恢复
+
+作为用户，我希望 ChatGPT Web 核对真正的执行结果，并知道下一步是否需要我决定。
+
+验收：Reviewer 将报告与 Git 差异、测试及现有项目状态交叉检查；证据损坏、过期、范围外改动或执行未结算时拒绝 `ACCEPTED`；非接受结果不自动重复运行；运行与决定可追溯。
+
+### US-5：一次真实、低负担的闭环
+
+作为用户，我希望通过一项小的真实任务验证 Planner → 授权 → DSH Agent → Reviewer 全程可用。
+
+验收：在单独许可的真实测试中看到真实 Agent 的工具批准、文件差异和测试结果，Reviewer 独立校验后才记录成功；用户无需手工编写 JSON；离线模拟测试不能替代真实 M2 验收。
+
+## 6. 当前实现与迁移状态（不是产品承诺）
+
+- `dev` 当前 `/dev-loop` **表面支持自然语言**，但 Controller / preflight / Bridge 仍依赖 ZIP 和附件通道；不能作为新产品的验收路径。
+- 本地独立提交 `b4eec3498b55bdea9e19afafe31b1ac22c1ac1b8`（M2-A）实现无 ZIP 的人工交接、审批、证据和安全拒绝；独立离线复验 133/133 通过。但 `/dev-loop-m2` 仍要求人工 JSON，未合入 `dev`，也没有真实 Agent 端到端验收。
+- 已存在的权限、审计、取证安全能力应优先复用；是否简化 M2-A 入口/状态实现，待依据本 PRD 单独确定最小代码修改范围。
+
+## 7. 尚待确认的产品/接入问题
+
+1. **真实交接能力**：ChatGPT Web 插件和 DSH 之间是否存在实际可用、经过授权的自动/半自动任务与复审结果通道；在证实之前允许人工介入，但不承诺最终无人工转交。
+2. **有限自动修复**：已批准范围内是否可以无再次人工确认地自动执行一次 `NEEDS_FIX`。当前 M2-A 保守地停止，待独立决策。
+3. **全局完成判定**：非本次 M2 最小验收场景下，测试失败与 `COMPLETE` 的统一规则及最终状态快照绑定，留待后续明确 Contract。
+
+以上待确认项不得以旧代码/测试行为代替产品决策，也不得阻塞保留已验证的离线安全能力。

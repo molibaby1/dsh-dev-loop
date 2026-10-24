@@ -1,65 +1,64 @@
 {
   "project": "dsh-dev-loop",
-  "branchName": "main",
-  "description": "Bounded Planner -> DSH Codex Executor -> Reviewer loop with Bridge attachments and auditable artifacts.",
+  "branchName": "dev",
+  "description": "Single-user, single-routine-DSH-Agent, natural-language-first ChatGPT Web Planner -> explicit approval -> DSH Agent -> independent ChatGPT Web Reviewer loop. Internal structured validation and evidence are retained; manual JSON commands and project ZIP/Bridge attachments are not default user interaction. The actual cross-system handoff remains subject to live verification.",
   "userStories": [
     {
       "id": "DL-001",
-      "title": "Create bounded artifact manifests and project packages",
-      "description": "Generate run-scoped ZIP and JSON/Markdown artifacts under a safe local root with canonical-path, byte-limit, hash, and provenance checks.",
+      "title": "Initiate and authorize development using natural language",
+      "description": "One user describes a task and receives a scoped ChatGPT Web plan in ordinary language. The Controller validates a machine-readable representation internally; the user need not construct JSON, IDs, or hashes.",
       "acceptanceCriteria": [
-        "Each artifact has runId, stage, name, mime, bytes, sha256, and source.",
-        "Symlink escape and oversized artifacts are rejected.",
-        "Packaging never writes into or cleans the product repository."
+        "A normal task and workflow approval can be completed without the user manually composing protocol JSON, run IDs, or SHA-256 fields.",
+        "A proposed plan identifies scope, checks, and stop conditions before the user authorizes execution.",
+        "Missing or mismatched authorization cannot trigger DSH execution."
       ],
       "priority": 1,
       "passes": false
     },
     {
       "id": "DL-002",
-      "title": "Implement the fixed bounded state machine",
-      "description": "Route Planner, approval, execution, evidence, and Reviewer phases through explicit states and one automatic NEEDS_FIX budget.",
+      "title": "Read relevant context without ZIPs or routine extra worktrees",
+      "description": "ChatGPT Web inspects pushed code by the designated GitHub dev ref and relevant unpushed state through an authorized local connection. The normal workflow uses one configured local workspace and one active branch rather than automatically creating per-task environments.",
       "acceptanceCriteria": [
-        "Invalid transitions fail closed.",
-        "ACCEPTED, NEEDS_FIX, NEEDS_REPLAN, DEFER, and ESCALATE route deterministically.",
-        "A second automatic NEEDS_FIX cannot execute."
+        "The Planner and Reviewer record actual repository, branch/commit, and relevant local context source or an explicit visibility limitation.",
+        "Normal task context transfer does not require generation, upload, or return of project ZIPs or Bridge attachment descriptors.",
+        "Routine tasks do not create another worktree, branch, or dependency installation unless isolation is justified and separately authorized."
       ],
       "priority": 2,
       "passes": false
     },
     {
       "id": "DL-003",
-      "title": "Connect DSH Codex subscription execution",
-      "description": "Current default: the DSH Agent uses the installed dsh-codex-subscription `openai-codex` route with `gpt-6-luna`, `workspace-write` and native `approval: ask`. Only trusted host/profile configuration can override these defaults; task text cannot raise permissions. Historical first-phase requirements used `gpt-5.6-luna` and `danger-full-access` without approval; they have been superseded.",
+      "title": "Execute only through the configured DSH Agent and approvals",
+      "description": "DSH Agent is the sole routine development and test executor. Trusted Host configuration selects the project root, provider/model and native tool permissions. Model names describe current implementation, not permanent product obligations.",
       "acceptanceCriteria": [
-        "The adapter uses the DSH Agent/LLM runtime rather than a second shell or ChatGPT execution plane.",
-        "Current default route/model is openai-codex / gpt-6-luna; native DSH workspace-write and approval: ask remain the default permission boundary.",
-        "The executor cwd is the configured product repository.",
-        "Executor output, cancellation, and failure become reportable evidence."
+        "An approved task executes only via the DSH Agent and its configured tools in the trusted workspace.",
+        "DSH native workspace permissions and approval policy are independent of workflow plan approval; rejected or missing approval fails closed without shell or connector fallback.",
+        "No automatic commit, push, merge, reset, or clean occurs without separate express authorization."
       ],
       "priority": 3,
       "passes": false
     },
     {
       "id": "DL-004",
-      "title": "Add Bridge attachment transport",
-      "description": "Extend DSH-Brain-Bridge CDP worker transport to select allowlisted local artifacts, wait for visible upload completion, send one prompt, and recover idempotently.",
+      "title": "Return auditable evidence and independent review without user-written JSON",
+      "description": "Controller keeps run/approval/evidence linkage in internal structured records while ChatGPT Web independently checks actual Git delta, DSH tool/test results and project state. Non-accepted conclusions do not automatically rerun.",
       "acceptanceCriteria": [
-        "DOM.setFileInputFiles is used only after local manifest and hash validation.",
-        "The prompt is not sent while any attachment is uploading.",
-        "Retry, timeout, page refresh, and worker restart have explicit outcomes without duplicate submission."
+        "Relevant actual files, diff, DSH tool approval outcomes, test command/results, and execution finalization are bound to the run and available for independent review.",
+        "Tampered, mismatched, stale or incomplete evidence is rejected; the Reviewer cannot claim completion from model report alone.",
+        "User-facing review and follow-up are ordinary-language summaries; any internal JSON contract is generated or consumed by tooling rather than typed by the user."
       ],
       "priority": 4,
       "passes": false
     },
     {
       "id": "DL-005",
-      "title": "Validate the deterministic first-phase loop",
-      "description": "Add fake Bridge, fake DSH Executor, CDP mock, and evidence tests; isolate any real smoke behind an explicit bounded command.",
+      "title": "Verify a real small end-to-end natural-language development loop",
+      "description": "With separate explicit authorization, run one real bounded ChatGPT Web planning, approval, DSH Agent development and testing, and ChatGPT Web independent review on a controlled project. Do not infer automatic app handoff capability from connector availability.",
       "acceptanceCriteria": [
-        "Fixture marker round trips through Planner and Reviewer fake transport.",
-        "Report, diff, and latest project ZIP are attached in Reviewer order.",
-        "Default tests use no production account or Codex quota."
+        "One separately authorized real run records plan approval, actual DSH Agent tool and test evidence, Git changes, Reviewer verification and a correlated terminal outcome.",
+        "The user completes the normal interaction without constructing JSON or ZIPs; any still-human-mediated cross-system handoff is clearly identified and evaluated rather than silently called automated.",
+        "Deterministic offline tests or unverified model reports alone do not count as completion of real M2 acceptance."
       ],
       "priority": 5,
       "passes": false
