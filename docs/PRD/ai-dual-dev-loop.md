@@ -2,7 +2,7 @@
 
 ## Background
 
-This repository owns a small development-loop Controller for a separate product repository. DeepSeek Harness remains the execution runtime and permission authority. `dsh-codex-subscription` provides the `openai-codex` route and `gpt-5.6-luna` model inside DSH. DSH-Brain-Bridge provides ChatGPT Web reasoning transport for Planner and Reviewer.
+This repository owns a small development-loop Controller for a separate product repository. DeepSeek Harness remains the execution runtime and permission authority. `dsh-codex-subscription` provides the `openai-codex` route and `gpt-6-luna` model inside DSH. DSH-Brain-Bridge provides ChatGPT Web reasoning transport for Planner and Reviewer.
 
 ## Goal
 
@@ -11,7 +11,7 @@ Implement one bounded, evidence-driven run:
 1. Package a small project artifact.
 2. Send a Planner request with the artifact through the Bridge attachment transport.
 3. Validate the Planner plan and authorize it automatically for the Web command (or wait for explicit approval when `autoApprove: false`).
-4. Execute the authorized task through a DSH Agent using `openai-codex` / `gpt-5.6-luna`.
+4. Execute the authorized task through a DSH Agent using `openai-codex` / `gpt-6-luna`.
 5. Collect report, diff, test result, and a fresh project artifact.
 6. Send those artifacts to a Reviewer through the Bridge attachment transport.
 7. Route one structured decision to `COMPLETE`, `EXECUTING`, `ANALYZING`, `WAITING`, or `STOPPED`.
@@ -35,6 +35,8 @@ Implement one bounded, evidence-driven run:
 - Local artifact paths remain inside Controller, Gateway, and Browser Worker protocol; they are never sent to ChatGPT.
 
 ## Current Executor permission default
+
+The original first-phase model `gpt-5.6-luna` is historical. The current Executor defaults to `openai-codex` / `gpt-6-luna` (subject to trusted host configuration).
 
 The original PRD's `danger-full-access` permission requirement is historical and is superseded by the DSH 0.2.1-rc.2 compatibility change: Executor defaults to `workspace-write` with DSH's native `approval: ask` policy. Only trusted host/profile configuration can select a higher preset; task text and model output cannot change it. `/dev-loop approve` authorizes the workflow plan and is separate from approval of DSH tool execution.
 
@@ -86,7 +88,7 @@ The Controller targets a configured repository root and never resets or cleans i
 - Failed, timed-out, refreshed, and restarted attachment requests have explicit failure or recovery outcomes.
 - Retrying the same request does not create duplicate submission.
 - ChatGPT output is consumed as validated data and never executed directly.
-- The Executor route is `openai-codex` with model `gpt-5.6-luna`. The original permission mapping (`danger-full-access` with no approval prompt) is a historical requirement superseded by the current Executor permission default above.
+- The Executor route is `openai-codex` with model `gpt-6-luna`. The original permission mapping (`danger-full-access` with no approval prompt) is a historical requirement superseded by the current Executor permission default above.
 - One `NEEDS_FIX` is allowed; a second automatic fix is rejected and stops the run.
 - Deterministic tests do not require a production ChatGPT account or paid Codex call.
 
