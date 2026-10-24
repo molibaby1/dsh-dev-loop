@@ -3,7 +3,7 @@ import { createDshDevLoopController } from './host.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 import { diagnosticForInput, diagnosticFromError } from './diagnostics.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
-import { DEV_LOOP_EVENTS, summarizeResult } from './presentation.mjs'
+import { summarizeResult } from './presentation.mjs'
 import { DEV_LOOP_VERSION } from './version.mjs'
 
 /** Parse friendly Chinese text or the legacy JSON `/dev-loop` input. */
@@ -53,9 +53,9 @@ export function parseDevLoopInput(rawInput, defaults = {}) {
 
 const activeRuns = new Map()
 
-/** Execute one command invocation and publish durable dev-loop session events. */
+/** Execute one command invocation while tracking active Controller runs for cancellation. */
 export async function executeDevLoopCommand({ ctx, config = {}, invocation } = {}) {
-  const { rawInput, agent, signal } = invocation ?? {}
+  const { rawInput, signal } = invocation ?? {}
   const action = parseDevLoopControl(rawInput)
   try {
     if (action) return await executeControlAction({ ctx, config, invocation, action })
@@ -66,7 +66,6 @@ export async function executeDevLoopCommand({ ctx, config = {}, invocation } = {
     const onEvent = event => {
       if (event.kind === 'started') activeRuns.set(event.runId, { abort: linked.abort, promise })
       if (event.kind === 'finished') activeRuns.delete(event.runId)
-      appendDevLoopEvent(agent, event)
     }
     promise = controller.run({ ...request, signal: linked.signal, onEvent })
     try {
@@ -100,7 +99,6 @@ async function executeControlAction({ ctx, config, invocation, action }) {
       return { kind: 'error', text: summarizeResult(result) }
     }
     const result = await controller.cancelRun({ runId: action.runId })
-    appendDevLoopEvent(invocation.agent, { kind: 'finished', at: new Date().toISOString(), ...result })
     return { kind: 'error', text: summarizeResult(result) }
   }
   const linked = linkAbortSignal(invocation.signal)
@@ -108,7 +106,6 @@ async function executeControlAction({ ctx, config, invocation, action }) {
   const onEvent = event => {
     if (event.kind === 'started') activeRuns.set(event.runId, { abort: linked.abort, promise })
     if (event.kind === 'finished') activeRuns.delete(event.runId)
-    appendDevLoopEvent(invocation.agent, event)
   }
   promise = controller.resumeApproved({
     runId: action.runId,
@@ -159,13 +156,6 @@ export function createDevLoopCommand({ ctx, config = {} } = {}) {
     input: { hint: '例如：修复登录页提交后没有反应的问题', images: false },
     handler: invocation => executeDevLoopCommand({ ctx, config, invocation }),
   }
-}
-
-export function appendDevLoopEvent(agent, event) {
-  const type = DEV_LOOP_EVENTS[event?.kind]
-  if (!type || !agent?.session?.append) return undefined
-  const { kind: _kind, ...data } = event
-  return agent.session.append(type, data)
 }
 
 function validateTestCommand(value) {

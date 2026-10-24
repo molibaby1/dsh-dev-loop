@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, symlink } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { createRequire } from 'node:module'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import test from 'node:test'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
 import { executeDevLoopCommand, createDevLoopCommand, parseDevLoopInput } from '../src/command.mjs'
 
 test('dev-loop command defaults to waiting for human approval', () => {
@@ -176,3 +181,173 @@ test('dev-loop command gives a plain-language empty-input hint', () => {
     artifactRoot: '/tmp/dsh-artifacts',
   }), /请输入一句要完成的需求/)
 })
+
+test('command outcomes remain in Controller storage and restore under the installed DSH session contract', async () => {
+  const validateStoredEvents = await loadDshSessionPersistenceValidator()
+  const artifactRoot = await mkdtemp(join(tmpdir(), 'dsh-loop-command-session-'))
+  const bridge = await createOfflineBridge()
+  const session = Session.create('session-command-compatibility')
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'run offline compatibility check' }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  const ctx = {
+    agents: {},
+    agentPresets: { mount() {} },
+    permissionPresets: { set() {} },
+  }
+  const config = {
+    projectRoot: process.cwd(),
+    artifactRoot,
+    bridgeBaseUrl: bridge.baseUrl,
+    bridgeTimeoutMs: 5000,
+  }
+  const invoke = rawInput => executeDevLoopCommand({ ctx, config, invocation: { rawInput, agent: { session } } })
+
+  try {
+    const waiting = await invoke(JSON.stringify({
+      problemPackage: { id: 'command-compatibility', summary: 'offline compatibility check' },
+      runId: 'run-compatibility-waiting',
+    }))
+    assert.equal(waiting.kind, 'success')
+    assert.match(waiting.text, /方案已生成，尚未修改代码/)
+    assert.equal((await readCommandState(artifactRoot, 'run-compatibility-waiting')).state, 'WAITING_FOR_APPROVAL')
+    const waitingManifest = await readCommandManifest(artifactRoot, 'run-compatibility-waiting')
+    assert.equal(waitingManifest.state, 'WAITING_FOR_APPROVAL')
+    assert.ok(waitingManifest.artifacts.some(artifact => artifact.name === 'plan.json'))
+    assert.deepEqual(session.snapshotEvents().map(event => event.type), ['user/message'])
+
+    const cancelled = await invoke('cancel run-compatibility-waiting')
+    assert.equal(cancelled.kind, 'error')
+    assert.match(cancelled.text, /任务已取消/)
+    assert.equal((await readCommandState(artifactRoot, 'run-compatibility-waiting')).state, 'CANCELLED')
+    const cancelledManifest = await readCommandManifest(artifactRoot, 'run-compatibility-waiting')
+    assert.equal(cancelledManifest.state, 'CANCELLED')
+    assert.ok(cancelledManifest.artifacts.some(artifact => artifact.name === 'plan.json'))
+    assert.ok(cancelledManifest.artifacts.some(artifact => artifact.name === 'diagnostic.json'))
+    assert.deepEqual(session.snapshotEvents().map(event => event.type), ['user/message'])
+
+    bridge.setMode('failure')
+    const failed = await invoke(JSON.stringify({
+      problemPackage: { id: 'command-compatibility-failure', summary: 'offline bridge failure' },
+      runId: 'run-compatibility-failed',
+    }))
+    assert.equal(failed.kind, 'error')
+    assert.match(failed.text, /任务失败/)
+    assert.equal((await readCommandState(artifactRoot, 'run-compatibility-failed')).state, 'FAILED')
+    const failedManifest = await readCommandManifest(artifactRoot, 'run-compatibility-failed')
+    assert.equal(failedManifest.state, 'FAILED')
+    assert.ok(failedManifest.artifacts.some(artifact => artifact.name === 'diagnostic.json'))
+    assert.deepEqual(session.snapshotEvents().map(event => event.type), ['user/message'])
+
+    bridge.setMode('blocked')
+    const active = invoke(JSON.stringify({
+      problemPackage: { id: 'command-compatibility-cancel', summary: 'cancel active offline request' },
+      runId: 'run-compatibility-active-cancel',
+    }))
+    await bridge.waitForBlockedRequest()
+    await invoke('cancel run-compatibility-active-cancel')
+    const activeResult = await active
+    assert.equal(activeResult.kind, 'error')
+    assert.match(activeResult.text, /任务已取消/)
+    assert.equal((await readCommandState(artifactRoot, 'run-compatibility-active-cancel')).state, 'CANCELLED')
+
+    const eventCopy = structuredClone(session.snapshotEvents())
+    assert.deepEqual(eventCopy.map(event => event.type), ['user/message'])
+    validateStoredEvents(session.header, eventCopy)
+    const restored = Session.fromRestore(session.id, eventCopy, session.header, 0, 'shared-frozen')
+    assert.deepEqual(restored.snapshotEvents().slice(0, eventCopy.length).map(event => event.type), ['user/message'])
+  } finally {
+    await bridge.close()
+    await rm(artifactRoot, { recursive: true, force: true })
+  }
+})
+
+async function loadDshSessionPersistenceValidator() {
+  const localRequire = createRequire(import.meta.url)
+  const sessionPackagePath = await realpath(localRequire.resolve('@deepseek-ai/dsh-session/package.json'))
+  const runtimeRequire = createRequire(sessionPackagePath)
+  const sessionPersistencePackagePath = runtimeRequire.resolve('@deepseek-ai/dsh-session-persistence/package.json')
+  const [sessionPackage, persistencePackage] = await Promise.all([
+    readFile(sessionPackagePath, 'utf8').then(JSON.parse),
+    readFile(sessionPersistencePackagePath, 'utf8').then(JSON.parse),
+  ])
+  assert.equal(sessionPackage.version, '0.2.1-rc.2')
+  assert.equal(persistencePackage.version, '0.2.1-rc.2')
+  const persistence = await import(pathToFileURL(runtimeRequire.resolve('@deepseek-ai/dsh-session-persistence')))
+  return persistence.validateStoredEvents
+}
+
+async function createOfflineBridge() {
+  let mode = 'success'
+  let notifyBlockedRequest
+  let blockedRequestSeen
+  const server = createServer((request, response) => {
+    void handleRequest(request, response).catch(error => {
+      response.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: error.message }))
+    })
+  })
+
+  async function handleRequest(request, response) {
+    if (request.method === 'HEAD' && request.url === '/') {
+      response.writeHead(200).end()
+      return
+    }
+    if (request.method === 'POST' && request.url === '/internal/attachments/requests') {
+      const body = await readRequestJson(request)
+      if (mode === 'failure') {
+        response.writeHead(503, { 'content-type': 'application/json' }).end(JSON.stringify({ message: 'offline bridge failure' }))
+        return
+      }
+      response.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify({ id: body.runId, status: 'pending' }))
+      return
+    }
+    if (request.method === 'GET' && request.url.includes('/wait?')) {
+      if (mode === 'blocked') {
+        notifyBlockedRequest?.()
+        request.once('aborted', () => response.destroy())
+        return
+      }
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        status: 'completed',
+        result: { executorTask: 'bounded offline task' },
+      }))
+      return
+    }
+    if (request.method === 'POST' && request.url.endsWith('/cancel')) {
+      response.writeHead(200, { 'content-type': 'application/json' }).end('{}')
+      return
+    }
+    response.writeHead(404, { 'content-type': 'application/json' }).end('{}')
+  }
+
+  await new Promise((resolve, reject) => server.listen(0, '127.0.0.1', resolve).once('error', reject))
+  const address = server.address()
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    setMode(value) {
+      mode = value
+      if (mode === 'blocked') {
+        blockedRequestSeen = new Promise(resolve => { notifyBlockedRequest = resolve })
+      }
+    },
+    async waitForBlockedRequest() {
+      await blockedRequestSeen
+    },
+    close: () => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+  }
+}
+
+async function readRequestJson(request) {
+  let body = ''
+  for await (const chunk of request) body += chunk
+  return JSON.parse(body)
+}
+
+async function readCommandState(artifactRoot, runId) {
+  return JSON.parse(await readFile(join(artifactRoot, runId, 'run-state.json'), 'utf8'))
+}
+
+async function readCommandManifest(artifactRoot, runId) {
+  return JSON.parse(await readFile(join(artifactRoot, runId, 'run-manifest.json'), 'utf8'))
+}
