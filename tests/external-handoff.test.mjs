@@ -176,6 +176,118 @@ test('session candidate lookup rejects an incompatible persisted manifest state'
   )
 })
 
+test('a settled early failed submission does not block later plans in the same or another session', async t => {
+  const fixture = await createFixture(t)
+  const stalePlan = {
+    ...fixture.plan,
+    observedContext: { ...fixture.plan.observedContext, commit: '0'.repeat(40) },
+  }
+  const failed = await (await fixture.createController({ sessionId: 'session-a' })).submitExternalPlan({ plan: stalePlan })
+  assert.equal(failed.state, 'FAILED')
+  assert.equal(failed.summary.hasModifiedProject, false)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal((await fixture.store.readJson({ runId: failed.runId, name: 'run-state.json' })).state, 'FAILED')
+  await assert.rejects(
+    fixture.store.readJson({ runId: failed.runId, name: 'run-request.json' }),
+    { code: 'ENOENT' },
+  )
+
+  const sameSessionPlan = await (await fixture.createController({ sessionId: 'session-a' })).submitExternalPlan({ plan: fixture.plan })
+  assert.equal(sameSessionPlan.state, 'WAITING_FOR_APPROVAL')
+  const sameSessionCandidate = await (await fixture.createController({ sessionId: 'session-a' })).findExternalRunForSession({ operation: 'approve' })
+  assert.deepEqual(sameSessionCandidate, {
+    runId: sameSessionPlan.runId,
+    state: 'WAITING_FOR_APPROVAL',
+    planSha256: sameSessionPlan.handoff.planSha256,
+  })
+  assert.equal(fixture.calls.executor, 0, 'candidate lookup must not approve or execute the plan')
+
+  const otherSessionPlan = await (await fixture.createController({ sessionId: 'session-b' })).submitExternalPlan({ plan: fixture.plan })
+  const otherSessionCandidate = await (await fixture.createController({ sessionId: 'session-b' })).findExternalRunForSession({ operation: 'approve' })
+  assert.deepEqual(otherSessionCandidate, {
+    runId: otherSessionPlan.runId,
+    state: 'WAITING_FOR_APPROVAL',
+    planSha256: otherSessionPlan.handoff.planSha256,
+  })
+  assert.equal(fixture.calls.executor, 0, 'another session must be able to discover its own plan without executing it')
+
+  const approved = await (await fixture.createController({ sessionId: 'session-a' })).approveExternalPlan({
+    runId: sameSessionCandidate.runId,
+    planSha256: sameSessionCandidate.planSha256,
+  })
+  assert.equal(approved.state, 'REVIEWING')
+  assert.equal(fixture.calls.executor, 1, 'execution starts only after explicit approval')
+})
+
+test('terminal early failures are skipped only when their finalization records agree', async t => {
+  const fixture = await createFixture(t)
+  const failed = await (await fixture.createController()).submitExternalPlan({
+    plan: { ...fixture.plan, observedContext: { ...fixture.plan.observedContext, commit: '0'.repeat(40) } },
+  })
+  assert.equal(failed.state, 'FAILED')
+  const manifest = await fixture.store.readJson({ runId: failed.runId, name: 'run-manifest.json' })
+  const summaryDescriptor = manifest.artifacts.find(artifact => artifact.name === 'run-summary.json')
+  assert.ok(summaryDescriptor)
+  assert.ok(manifest.artifacts.some(artifact => artifact.name === 'diagnostic.json'))
+
+  manifest.state = 'CANCELLED'
+  await fixture.store.writeJson({ runId: failed.runId, stage: 'manifest', name: 'run-manifest.json', value: manifest })
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    error => error.code === 'RUN_RECORD_MISMATCH',
+  )
+})
+
+test('terminal runs without settled execution and audit records are not skipped during candidate lookup', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const approved = await (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
+  const stopped = await (await fixture.createController()).submitExternalReview({
+    runId: submitted.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'NEEDS_FIX',
+    summary: 'Record a terminal review without scheduling another execution.',
+    findings: ['The fixture review requests a follow-up.'],
+  })
+  assert.equal(stopped.state, 'STOPPED')
+
+  const active = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const settledPath = join(fixture.artifactRoot, stopped.runId, 'execution-owner-settled.json')
+  const settledBytes = await readFile(settledPath)
+  await rm(settledPath)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    { code: 'ENOENT' },
+  )
+  await writeFile(settledPath, settledBytes)
+
+  const candidate = await (await fixture.createController()).findExternalRunForSession({ operation: 'approve' })
+  assert.equal(candidate.runId, active.runId)
+  await rm(join(fixture.artifactRoot, stopped.runId, 'audit-trace.json'))
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+    { code: 'ENOENT' },
+  )
+  assert.equal(active.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(fixture.calls.executor, 1, 'candidate lookup must not start the active plan')
+})
+
+test('active session candidates still require both request and plan artifacts', async t => {
+  for (const name of ['run-request.json', 'plan.json']) {
+    await t.test(name, async subtest => {
+      const fixture = await createFixture(subtest)
+      const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+      await rm(join(fixture.artifactRoot, submitted.runId, name))
+
+      await assert.rejects(
+        () => fixture.createController().then(controller => controller.findExternalRunForSession({ operation: 'approve' })),
+        { code: 'ENOENT' },
+      )
+      assert.equal(fixture.calls.executor, 0)
+    })
+  }
+})
+
 test('manual approval executes once, persists evidence for a new Controller, then accepts correlated review', async t => {
   const fixture = await createFixture(t)
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
@@ -577,6 +689,11 @@ test('an exited owner with incomplete finalization cannot be reviewed but can be
   assert.equal(stopped.decision, null)
   assert.equal(stopped.audit.audit.at(-1).executionFinalizationIncomplete, true)
   assert.equal(fixture.calls.executor, 1)
+
+  const nextPlan = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const candidate = await (await fixture.createController()).findExternalRunForSession({ operation: 'approve' })
+  assert.equal(candidate.runId, nextPlan.runId)
+  assert.equal(fixture.calls.executor, 1, 'terminal cancellation lookup must not execute another plan')
 })
 
 for (const [label, settledValue] of [

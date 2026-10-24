@@ -10,6 +10,8 @@ import { DEV_LOOP_FINGERPRINT, publicProgressEvent } from './presentation.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 
+const TERMINAL_RUN_STATES = new Set(['COMPLETE', 'STOPPED', 'FAILED', 'CANCELLED'])
+
 export class DevLoopController {
   constructor({ store, bridge, executor, evidenceCollector, gitAdapter, preflight, projectRoot, sessionId, mode = 'legacy', maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
     if (!['legacy', 'manual-handoff'].includes(mode)) throw new Error(`unsupported dev-loop mode: ${String(mode)}`)
@@ -730,6 +732,11 @@ export class DevLoopController {
         throw new DevLoopError('RUN_RECORD_MISMATCH', `persisted manifest does not match run ${runId}`)
       }
       if (manifest.handoff?.mode !== 'manual-handoff') continue
+      const state = await this.store.readJson({ runId, name: 'run-state.json' })
+      if (state && TERMINAL_RUN_STATES.has(state.state)) {
+        await assertSettledTerminalManualHandoff(this.store, { runId, state, manifest })
+        continue
+      }
       const data = await loadManualHandoffData(this.store, runId)
       const storedSessionId = assertDshSessionId(data.request.sessionId)
       if (storedSessionId !== sessionId) continue
@@ -1605,6 +1612,106 @@ async function loadManualHandoffData(store, runId) {
     planRecord,
     baselineSnapshot,
   }
+}
+
+async function assertSettledTerminalManualHandoff(store, { runId, state, manifest } = {}) {
+  if (state.runId !== runId || manifest.runId !== runId) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal state and manifest do not match runId')
+  }
+  if (!STATES.includes(state.state)) {
+    throw new DevLoopError('RUN_STATE_INVALID', `persisted run state is invalid: ${String(state.state)}`)
+  }
+  if (manifest.state !== state.state) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal state and manifest disagree')
+  }
+  if (
+    manifest.schema !== 1
+    || manifest.handoff?.mode !== 'manual-handoff'
+    || !Array.isArray(manifest.artifacts)
+  ) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal handoff manifest is incomplete')
+  }
+  try {
+    new RunStateMachine({ runId, maxFixes: 1, initialSnapshot: state })
+  } catch (error) {
+    throw new DevLoopError('RUN_STATE_INVALID', 'persisted terminal state is invalid', { cause: error })
+  }
+
+  const summaryDescriptor = findArtifact(manifest, 'run-summary.json')
+  const summary = await store.verifyJson({ runId, name: summaryDescriptor.name, sha256: summaryDescriptor.sha256 })
+  if (
+    summary.schema !== 1
+    || summary.runId !== runId
+    || summary.state !== state.state
+    || summary.handoff?.mode !== 'manual-handoff'
+    || typeof summary.hasModifiedProject !== 'boolean'
+    || JSON.stringify(summary.diagnostic ?? null) !== JSON.stringify(manifest.phases?.diagnostic ?? null)
+    || (state.state === 'FAILED' && summary.diagnostic == null)
+    || (state.state === 'COMPLETE' && (
+      summary.hasModifiedProject !== true
+      || summary.decision !== 'ACCEPTED'
+      || summary.test?.ok !== true
+    ))
+  ) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal summary does not match its run state')
+  }
+  if (summary.diagnostic != null) {
+    const diagnosticDescriptor = findArtifact(manifest, 'diagnostic.json')
+    const diagnostic = await store.verifyJson({ runId, name: diagnosticDescriptor.name, sha256: diagnosticDescriptor.sha256 })
+    if (JSON.stringify(diagnostic) !== JSON.stringify(summary.diagnostic)) {
+      throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal diagnostic does not match its summary')
+    }
+  }
+  if (summary.hasModifiedProject) {
+    const ownerDescriptor = manifest.artifacts.find(artifact => artifact.name === 'execution-owner.json')
+    const incompleteFinalizationStop = state.state === 'CANCELLED'
+      && state.audit.at(-1)?.to === 'CANCELLED'
+      && state.audit.at(-1)?.executionFinalizationIncomplete === true
+    let owner
+    if (ownerDescriptor?.sha256) {
+      owner = await store.verifyJson({ runId, name: ownerDescriptor.name, sha256: ownerDescriptor.sha256 })
+    } else if (incompleteFinalizationStop && !ownerDescriptor) {
+      owner = await store.readJson({ runId, name: 'execution-owner.json' })
+    } else {
+      throw new DevLoopError('RUN_ARTIFACT_MISSING', 'persisted terminal run is missing verified artifact execution-owner.json')
+    }
+    const planSha256 = manifest.handoff.planSha256
+    if (owner?.schema !== 1 || owner.runId !== runId || owner.planSha256 !== planSha256) {
+      throw new DevLoopError('RUN_EXECUTION_OWNER_UNKNOWN', 'persisted terminal execution owner does not match its run and plan')
+    }
+    if (incompleteFinalizationStop) {
+      assertExecutionOwnerStopped(owner, runId)
+    } else {
+      if (!ownerDescriptor?.sha256) {
+        throw new DevLoopError('RUN_EXECUTION_OWNER_UNKNOWN', 'persisted terminal execution owner has no verified manifest digest')
+      }
+      const settled = await store.readJson({ runId, name: 'execution-owner-settled.json' })
+      if (
+        settled.schema !== 1
+        || settled.runId !== runId
+        || settled.planSha256 !== planSha256
+        || settled.executionOwnerSha256 !== ownerDescriptor.sha256
+      ) {
+        throw new DevLoopError('RUN_EXECUTION_OWNER_UNKNOWN', 'persisted terminal execution settlement does not match its owner')
+      }
+    }
+  }
+
+  const audit = await store.readJson({ runId, name: 'audit-trace.json' })
+  if (audit?.schema !== 1 || !sameRunStateSnapshot(state, audit) || !Array.isArray(audit.artifacts)) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal audit does not match its run state')
+  }
+  const audited = new Map(audit.artifacts.map(artifact => [artifact.name, artifact]))
+  for (const artifact of manifest.artifacts) {
+    if (audited.get(artifact.name)?.sha256 !== artifact.sha256) {
+      throw new DevLoopError('RUN_RECORD_MISMATCH', `persisted terminal audit does not include ${artifact.name}`)
+    }
+  }
+  const manifestDescriptor = audited.get('run-manifest.json')
+  if (!manifestDescriptor?.sha256) {
+    throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal audit has no manifest digest')
+  }
+  await store.verifyArtifact({ runId, name: manifestDescriptor.name, sha256: manifestDescriptor.sha256 })
 }
 
 function findArtifact(manifest, name) {
