@@ -20,7 +20,6 @@ const DEFINITIONS = Object.freeze({
   DSH_EXECUTION_INCOMPLETE: ['DSH Agent 未完成执行', '请查看 DSH 会话和已保留的项目差异，再决定是否重新授权。', false],
   DSH_TOOL_APPROVAL_FAILED: ['DSH 工具审批未成功', '请检查 DSH 原生审批记录；本次运行没有继续取证或自动重试。', false],
   EXECUTION_SCOPE_VIOLATION: ['DSH Agent 修改了批准范围外的文件', '请检查保留的 Git 差异；本次运行不会进入 Reviewer 完成阶段。', false],
-  PROJECT_COMMIT_CHANGED: ['DSH Agent 改动了项目 commit', '请检查当前分支与 Git 历史；本次运行不会进入 Reviewer 完成阶段。', false],
   EVIDENCE_STALE: ['Reviewer 看到的项目状态已过期', '请检查当前项目差异；本次运行已停止，需基于当前状态重新交接。', false],
   CANCELLED: ['任务已取消', '当前修改会被保留，请在继续前查看代码差异。', false],
   RUN_NOT_FOUND: ['找不到这次运行', '请确认 runId 是否正确，并检查产物目录是否可访问。', false],

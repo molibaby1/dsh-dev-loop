@@ -4,10 +4,10 @@ Bounded AI dual-layer development loop for a separate project repository.
 
 ## Runtime boundary
 
-- Planner and Reviewer use DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
+- M2 Planner and Reviewer handoffs are manual plain-text transfers between ChatGPT Web and DSH; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
 - Executor uses the installed `dsh-codex-subscription` DSH provider route: `openai-codex` / `gpt-6-luna`.
 - The Executor is a DSH Agent, so DSH remains the tool, permission, session, and execution authority.
-- The Controller never resets, cleans, commits, or pushes the product repository.
+- The M2 Controller allows Git operations required by the approved task under DSH native permissions, while keeping project and file-scope checks and giving the Reviewer commit-history, file-diff, and final-state evidence.
 
 ## Development
 
@@ -71,7 +71,7 @@ DSH Agent 执行任务：
 /dev-loop-m2 批准当前方案
 ```
 
-批准前 Controller 会重新检查方案哈希、可信项目根目录、分支和工作区状态。随后由 DSH Agent 在原生审批下执行；DSH 审批拒绝、取消、超时、审批证据缺失、测试失败或范围越界都会停止，不会切换到宿主备用执行器。执行和取证完成后进入 `REVIEWING`，命令会显示唯一审核回执、证据目录和 `evidence-manifest.json` 路径。把回执、当前变更和 Reviewer 所需证据交给 ChatGPT Reviewer 人工检查。
+批准前 Controller 会重新检查方案哈希、可信项目根目录、分支和工作区状态。随后由 DSH Agent 在原生权限与审批下执行；批准任务需要的 Git 操作不再受 M2 Controller 的额外类别禁令或审批要求限制，项目路径和文件范围校验仍然生效。DSH 审批拒绝、取消、超时、审批证据缺失、测试失败或范围越界都会停止，不会切换到宿主备用执行器。执行和取证完成后进入 `REVIEWING`，命令会显示唯一审核回执、证据目录和 `evidence-manifest.json` 路径。Reviewer 可通过 `git-history.patch`、`git-diff.patch`、快照和最终 HEAD/工作区状态核验提交与代码；把回执和这些证据交给 ChatGPT Reviewer 人工检查。
 
 Reviewer 应返回审核回执、decision、摘要和发现的问题，再把其结果粘贴到 `/dev-loop-m2`。标题和 decision 值必须精确填写；无发现时写 `- 无`：
 

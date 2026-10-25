@@ -617,7 +617,7 @@ export class DevLoopController {
       evidenceSummary = evidence.summary
       const evidenceArtifacts = []
       for (const artifact of evidence.artifacts) evidenceArtifacts.push(await record(artifact))
-      assertExternalExecutionScope(plan.scope, baseline, evidence)
+      assertExternalExecutionScope(plan.scope, evidence)
       const projectState = contextFromSnapshot(evidence.after)
       const evidenceManifest = await record(await this.store.writeJsonOnce({
         runId,
@@ -1842,15 +1842,12 @@ function externalExecutionTask(plan) {
     `Excluded repository paths: ${JSON.stringify(plan.scope.excludedPaths)}.`,
     `Non-goals: ${JSON.stringify(plan.scope.nonGoals)}.`,
     `Execution requirements: ${JSON.stringify(plan.executionRequirements)}.`,
-    'Do not modify files outside the included paths or any excluded path. Do not commit, push, merge, reset, or clean. Do not run tests; the Host runs the configured test command through DSH with native approval.',
+    'Git operations needed to complete the approved task are permitted under DSH native tool permissions. Do not modify files outside the included paths or any excluded path. Do not run tests; the Host runs the configured test command through DSH with native approval.',
     `Approved plan JSON:\n${JSON.stringify(plan)}`,
   ].join('\n')
 }
 
-function assertExternalExecutionScope(scope, baseline, evidence) {
-  if (evidence.after?.commit !== baseline?.commit) {
-    throw new DevLoopError('PROJECT_COMMIT_CHANGED', 'DSH Agent changed the project commit during the approved run')
-  }
+function assertExternalExecutionScope(scope, evidence) {
   const outOfScope = (evidence.summary?.changedFileNames ?? []).filter(file => {
     const included = scope.includedPaths.some(path => containsRepositoryPath(path, file))
     const excluded = scope.excludedPaths.some(path => containsRepositoryPath(path, file))

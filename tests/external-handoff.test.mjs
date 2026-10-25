@@ -526,6 +526,8 @@ test('M2 external review stops if the project changed after evidence collection'
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
   const approved = await (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
   await writeFile(join(fixture.projectRoot, 'reviewer-stale.txt'), 'changed after evidence\n')
+  runGit(fixture.projectRoot, ['add', 'reviewer-stale.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'change after evidence'])
 
   const stopped = await (await fixture.createController()).submitExternalReview({
     runId: submitted.runId,
@@ -915,8 +917,51 @@ test('M2 execution stops when DSH changes a path outside the approved scope', as
   assert.equal(fixture.calls.executor, 1)
 })
 
-test('M2 execution stops if the DSH Agent creates a commit', async t => {
-  const fixture = await createFixture(t, { createCommit: true })
+test('M2 execution allows an in-scope commit and reviews its history without losing prior dirty files', async t => {
+  const fixture = await createFixture(t, { createCommit: true, preexistingFile: true })
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+
+  const approved = await (await fixture.createController()).approveExternalPlan({
+    runId: submitted.runId,
+    planSha256: submitted.handoff.planSha256,
+  })
+
+  assert.equal(approved.state, 'REVIEWING', JSON.stringify(approved.diagnostic))
+  assert.equal(approved.diagnostic, null)
+  assert.equal(fixture.calls.executor, 1)
+  assert.deepEqual(approved.summary.changedFileNames, ['result.txt'])
+  assert.equal(await readFile(join(fixture.projectRoot, 'outside.txt'), 'utf8'), 'pre-existing uncommitted work\n')
+
+  const baseline = await fixture.store.readJson({ runId: submitted.runId, name: 'baseline-snapshot.json' })
+  assert.match(baseline.fileHashes['outside.txt'], /^[a-f0-9]{64}$/u)
+  const after = await fixture.store.readJson({ runId: submitted.runId, name: 'after-snapshot.json' })
+  assert.notEqual(after.commit, baseline.commit)
+  assert.equal(baseline.dirty, true)
+  assert.equal(after.dirty, true)
+  assert.equal(after.fileHashes['outside.txt'], baseline.fileHashes['outside.txt'])
+
+  const manifest = await fixture.store.readJson({ runId: submitted.runId, name: 'evidence-manifest.json' })
+  assert.ok(manifest.artifacts.some(artifact => artifact.name === 'git-history.patch'))
+  const history = await readFile(join(fixture.artifactRoot, submitted.runId, 'git-history.patch'), 'utf8')
+  assert.match(history, /unexpected agent commit/)
+  assert.match(history, /result\.txt/)
+  const delta = await readFile(join(fixture.artifactRoot, submitted.runId, 'git-diff.patch'), 'utf8')
+  assert.match(delta, /result\.txt/)
+  assert.doesNotMatch(delta, /outside\.txt/)
+
+  const completed = await (await fixture.createController()).submitExternalReview({
+    runId: submitted.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'ACCEPTED',
+    summary: 'The committed code, history and final Git state match the approved scope.',
+    findings: [],
+  })
+  assert.equal(completed.state, 'COMPLETE')
+  assert.deepEqual(completed.summary.changedFileNames, ['result.txt'])
+})
+
+test('M2 rejects a commit that captures pre-existing changes outside the approved scope', async t => {
+  const fixture = await createFixture(t, { createCommit: true, preexistingFile: true, stageAll: true })
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
 
   const stopped = await (await fixture.createController()).approveExternalPlan({
@@ -925,8 +970,50 @@ test('M2 execution stops if the DSH Agent creates a commit', async t => {
   })
 
   assert.equal(stopped.state, 'FAILED')
-  assert.equal(stopped.diagnostic.code, 'PROJECT_COMMIT_CHANGED')
-  assert.equal(fixture.calls.executor, 1)
+  assert.equal(stopped.diagnostic.code, 'EXECUTION_SCOPE_VIOLATION')
+  assert.deepEqual(stopped.summary.changedFileNames, ['outside.txt', 'result.txt'])
+  assert.equal(await readFile(join(fixture.projectRoot, 'outside.txt'), 'utf8'), 'pre-existing uncommitted work\n')
+  const baseline = await fixture.store.readJson({ runId: submitted.runId, name: 'baseline-snapshot.json' })
+  assert.match(baseline.fileHashes['outside.txt'], /^[a-f0-9]{64}$/u)
+  assert.equal(await readFile(join(fixture.artifactRoot, submitted.runId, '.snapshots', 'baseline', 'outside.txt'), 'utf8'), 'pre-existing uncommitted work\n')
+  assert.match(await readFile(join(fixture.artifactRoot, submitted.runId, 'git-history.patch'), 'utf8'), /outside\.txt/)
+})
+
+test('M2 permits git clean but rejects deleting a pre-existing file outside the approved scope', async t => {
+  const fixture = await createFixture(t, { preexistingFile: true, cleanPreexistingOutside: true })
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+
+  const stopped = await (await fixture.createController()).approveExternalPlan({
+    runId: submitted.runId,
+    planSha256: submitted.handoff.planSha256,
+  })
+
+  assert.equal(stopped.state, 'FAILED')
+  assert.equal(stopped.diagnostic.code, 'EXECUTION_SCOPE_VIOLATION')
+  assert.deepEqual(stopped.summary.changedFileNames, ['outside.txt', 'result.txt'])
+  await assert.rejects(readFile(join(fixture.projectRoot, 'outside.txt')), { code: 'ENOENT' })
+  const baseline = await fixture.store.readJson({ runId: submitted.runId, name: 'baseline-snapshot.json' })
+  assert.equal(await readFile(join(fixture.artifactRoot, submitted.runId, '.snapshots', 'baseline', 'outside.txt'), 'utf8'), 'pre-existing uncommitted work\n')
+  assert.match(baseline.fileHashes['outside.txt'], /^[a-f0-9]{64}$/u)
+})
+
+test('M2 scope validation sees out-of-scope paths committed and reverted during execution', async t => {
+  const fixture = await createFixture(t, { writeOutsideScope: true, createCommit: true, stageAll: true, revertCommit: true })
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+
+  const stopped = await (await fixture.createController()).approveExternalPlan({
+    runId: submitted.runId,
+    planSha256: submitted.handoff.planSha256,
+  })
+
+  assert.equal(stopped.state, 'FAILED')
+  assert.equal(stopped.diagnostic.code, 'EXECUTION_SCOPE_VIOLATION')
+  assert.deepEqual(stopped.summary.changedFileNames, ['outside.txt', 'result.txt'])
+  await assert.rejects(readFile(join(fixture.projectRoot, 'outside.txt')), { code: 'ENOENT' })
+  await assert.rejects(readFile(join(fixture.projectRoot, 'result.txt')), { code: 'ENOENT' })
+  const history = await readFile(join(fixture.artifactRoot, submitted.runId, 'git-history.patch'), 'utf8')
+  assert.match(history, /unexpected agent commit/)
+  assert.match(history, /Revert "unexpected agent commit"/)
 })
 
 test('unpaired DSH tool approval cannot produce REVIEWING evidence', async t => {
@@ -964,7 +1051,7 @@ test('non-ACCEPTED external review stops without another DSH execution', async t
   assert.equal(fixture.calls.executor, 1)
 })
 
-async function createFixture(t, { testOk = true, writeOutsideScope = false, createCommit = false, writeResult = true, executorEvents, executorStarted, executorGate, executionOwnerPid, approvalClaimWritten, approvalClaimGate, reviewClaimWritten, reviewClaimGate, } = {}) {
+async function createFixture(t, { testOk = true, writeOutsideScope = false, createCommit = false, preexistingFile = false, cleanPreexistingOutside = false, stageAll = false, revertCommit = false, writeResult = true, executorEvents, executorStarted, executorGate, executionOwnerPid, approvalClaimWritten, approvalClaimGate, reviewClaimWritten, reviewClaimGate, } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-loop-m2-fixture-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const projectRoot = join(root, 'project')
@@ -976,6 +1063,7 @@ async function createFixture(t, { testOk = true, writeOutsideScope = false, crea
   runGit(projectRoot, ['config', 'user.email', 'm2-fixture@example.invalid'])
   runGit(projectRoot, ['add', 'README.md'])
   runGit(projectRoot, ['commit', '--quiet', '-m', 'fixture baseline'])
+  if (preexistingFile) await writeFile(join(projectRoot, 'outside.txt'), 'pre-existing uncommitted work\n')
   const commit = runGit(projectRoot, ['rev-parse', 'HEAD'])
   const calls = { executor: 0, test: 0, zip: 0, bridge: 0 }
   const executor = {
@@ -984,16 +1072,19 @@ async function createFixture(t, { testOk = true, writeOutsideScope = false, crea
       assert.equal(cwd, await realpath(projectRoot))
       assert.match(task, /Approved plan JSON:/)
       assert.match(task, /Included repository paths: \["result.txt"\]/)
-      assert.match(task, /Do not commit, push, merge, reset, or clean/)
+      assert.match(task, /Git operations needed to complete the approved task are permitted under DSH native tool permissions/)
+      assert.match(task, /Do not modify files outside the included paths or any excluded path/)
       assert.match(task, /Create result\.txt with the approved fixture output\./)
       executorStarted?.resolve()
       if (executorGate) await executorGate
       if (signal?.aborted) throw Object.assign(new Error('fake DSH execution cancelled'), { name: 'AbortError', code: 'CANCELLED' })
       if (writeResult) await writeFile(join(cwd, 'result.txt'), 'fixture change\n')
       if (writeOutsideScope) await writeFile(join(cwd, 'outside.txt'), 'out of scope\n')
+      if (cleanPreexistingOutside) runGit(cwd, ['clean', '--force', '--', 'outside.txt'])
       if (createCommit) {
-        runGit(cwd, ['add', 'result.txt'])
+        runGit(cwd, stageAll ? ['add', '--all'] : ['add', 'result.txt'])
         runGit(cwd, ['commit', '--quiet', '-m', 'unexpected agent commit'])
+        if (revertCommit) runGit(cwd, ['revert', '--quiet', '--no-edit', 'HEAD'])
       }
       return {
         runId: 'fake-dsh-run',

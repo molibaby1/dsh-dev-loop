@@ -8,7 +8,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 
 const GIT_TIMEOUT_MS = 30_000
 const GIT_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
-const GIT_OPERATIONS = new Set(['head', 'root', 'status', 'diff', 'diff-stat', 'files', 'snapshot-diff'])
+const GIT_OPERATIONS = new Set(['head', 'root', 'status', 'diff', 'diff-stat', 'files', 'history', 'history-files', 'committed-files', 'snapshot-diff'])
 
 /** Create the closed, project-bound Git adapter used only for evidence queries. */
 export function createGitEvidenceAdapter({ projectRoot, artifactRoot, timeoutMs = GIT_TIMEOUT_MS } = {}) {
@@ -19,12 +19,15 @@ export function createGitEvidenceAdapter({ projectRoot, artifactRoot, timeoutMs 
 
   const runGitEvidence = async function runGitEvidence({ operation, repoRoot = trustedProjectRoot, signal, ...parameters } = {}) {
     if (!GIT_OPERATIONS.has(operation)) throw new Error(`unsupported Git evidence operation: ${String(operation)}`)
-    const allowed = operation === 'snapshot-diff' ? ['snapshotRoot', 'beforeSnapshot', 'afterSnapshot', 'file', 'beforeExists', 'afterExists'] : []
+    const allowed = operation === 'snapshot-diff'
+      ? ['snapshotRoot', 'beforeSnapshot', 'afterSnapshot', 'file', 'beforeExists', 'afterExists']
+      : ['history', 'history-files'].includes(operation) ? ['includeCommit', 'excludeCommit']
+        : operation === 'committed-files' ? ['beforeCommit', 'afterCommit'] : []
     for (const key of Object.keys(parameters)) if (!allowed.includes(key)) throw new Error(`unsupported Git evidence parameter: ${key}`)
     const repo = await canonicalExistingDirectory(repoRoot, 'repository')
     if (repo !== trustedProjectRoot) throw new Error('Git evidence repository does not match configured projectRoot')
     let cwd = repo
-    const filterOverrides = ['status', 'diff', 'diff-stat'].includes(operation)
+    const filterOverrides = ['status', 'diff', 'diff-stat', 'history', 'committed-files'].includes(operation)
       ? await localFilterOverrides(executable, repo, signal, timeoutMs)
       : []
     let args = gitArguments(operation, undefined, undefined, filterOverrides)
@@ -40,6 +43,14 @@ export function createGitEvidenceAdapter({ projectRoot, artifactRoot, timeoutMs 
       if (parameters.beforeExists !== true && parameters.beforeExists !== false) throw new Error('beforeExists must be boolean')
       if (parameters.afterExists !== true && parameters.afterExists !== false) throw new Error('afterExists must be boolean')
       args = gitArguments(operation, before, after)
+    } else if (operation === 'history' || operation === 'history-files') {
+      assertCommitId(parameters.includeCommit, 'includeCommit')
+      assertCommitId(parameters.excludeCommit, 'excludeCommit')
+      args = gitArguments(operation, parameters.includeCommit, parameters.excludeCommit, filterOverrides)
+    } else if (operation === 'committed-files') {
+      assertCommitId(parameters.beforeCommit, 'beforeCommit')
+      assertCommitId(parameters.afterCommit, 'afterCommit')
+      args = gitArguments(operation, parameters.beforeCommit, parameters.afterCommit, filterOverrides)
     }
     return runGit(executable, args, cwd, signal, timeoutMs)
   }
@@ -91,6 +102,9 @@ function gitArguments(operation, before, after, filterOverrides = []) {
     case 'status': return [...prefix, 'status', '--short', '--branch', '--untracked-files=normal']
     case 'diff': return [...prefix, 'diff', '--binary', '--no-ext-diff', '--no-textconv']
     case 'diff-stat': return [...prefix, 'diff', '--stat', '--no-ext-diff', '--no-textconv']
+    case 'history': return [...prefix, 'log', '--patch', '--stat', '--diff-merges=first-parent', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-color', '--no-notes', '--no-show-signature', '--format=%H %P %aI %s', before, '--not', after]
+    case 'history-files': return [...prefix, 'log', '--diff-merges=first-parent', '--name-only', '-z', '--format=', before, '--not', after]
+    case 'committed-files': return [...prefix, 'diff', '--name-only', '--no-renames', '-z', '--no-ext-diff', '--no-textconv', before, after]
     case 'files': return [...prefix, 'ls-files', '-co', '--exclude-standard', '-z']
     case 'snapshot-diff': return [...prefix, 'diff', '--no-index', '--binary', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', before, after]
     default: throw new Error(`unsupported Git evidence operation: ${String(operation)}`)
@@ -297,6 +311,12 @@ function safeSnapshotName(value) {
   return value
 }
 
+function assertCommitId(value, label) {
+  if (typeof value !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(value)) {
+    throw new Error(`${label} must be a full Git commit SHA`)
+  }
+}
+
 function snapshotNameFromPath(path) {
   return safeSnapshotName(basename(path))
 }
@@ -308,8 +328,8 @@ function abortError(message) {
   return error
 }
 
-async function git(gitAdapter, repoRoot, operation, signal) {
-  const result = await gitAdapter({ operation, repoRoot, signal })
+async function git(gitAdapter, repoRoot, operation, signal, parameters = {}) {
+  const result = await gitAdapter({ operation, repoRoot, signal, ...parameters })
   if (result.aborted) throw abortError('Git evidence collection cancelled')
   if (result.timedOut) throw new Error(`git evidence operation timed out: ${operation}`)
   if (result.outputLimitExceeded) throw new Error(`git evidence output exceeded the limit: ${operation}`)
@@ -318,7 +338,7 @@ async function git(gitAdapter, repoRoot, operation, signal) {
   return result.stdout
 }
 
-export async function captureGitSnapshot({ repoRoot, gitAdapter, snapshotRoot, artifactRoot = gitAdapter?.artifactRoot, snapshotName = 'baseline', signal }) {
+export async function captureGitSnapshot({ repoRoot, gitAdapter, snapshotRoot, artifactRoot = gitAdapter?.artifactRoot, snapshotName = 'baseline', compareCommit, signal }) {
   throwIfAborted(signal)
   repoRoot = await canonicalExistingDirectory(repoRoot, 'repository')
   const [commit, status, diff, diffStat, fileList] = await Promise.all([
@@ -331,6 +351,28 @@ export async function captureGitSnapshot({ repoRoot, gitAdapter, snapshotRoot, a
   const files = parseNulPaths(fileList)
   const snapshotDir = snapshotRoot ? join(resolve(snapshotRoot), safeSnapshotName(snapshotName)) : undefined
   const fileHashes = snapshotDir ? await copyAndHashFiles(repoRoot, files, snapshotDir, artifactRoot, signal) : {}
+  let committedFiles = []
+  let commitHistory = ''
+  if (compareCommit && compareCommit !== commit.trim()) {
+    const [committedFileList, addedHistory, removedHistory, addedPaths, removedPaths] = await Promise.all([
+      git(gitAdapter, repoRoot, 'committed-files', signal, { beforeCommit: compareCommit, afterCommit: commit.trim() }),
+      git(gitAdapter, repoRoot, 'history', signal, { includeCommit: commit.trim(), excludeCommit: compareCommit }),
+      git(gitAdapter, repoRoot, 'history', signal, { includeCommit: compareCommit, excludeCommit: commit.trim() }),
+      git(gitAdapter, repoRoot, 'history-files', signal, { includeCommit: commit.trim(), excludeCommit: compareCommit }),
+      git(gitAdapter, repoRoot, 'history-files', signal, { includeCommit: compareCommit, excludeCommit: commit.trim() }),
+    ])
+    committedFiles = [...new Set([
+      ...parseNulPaths(committedFileList),
+      ...parseNulPaths(addedPaths),
+      ...parseNulPaths(removedPaths),
+    ])].sort()
+    commitHistory = [
+      `# Commits reachable from ${commit.trim()} but not ${compareCommit}`,
+      addedHistory.trim(),
+      `# Commits reachable from ${compareCommit} but not ${commit.trim()}`,
+      removedHistory.trim(),
+    ].filter(Boolean).join('\n\n')
+  }
   return {
     commit: commit.trim(),
     status,
@@ -339,6 +381,7 @@ export async function captureGitSnapshot({ repoRoot, gitAdapter, snapshotRoot, a
     dirty: status.split('\n').some(line => /^[MADRCU?]{1,2}\s/.test(line)),
     files,
     fileHashes,
+    ...(compareCommit ? { compareCommit, committedFiles, commitHistory } : {}),
     snapshotName,
     snapshotDir,
     snapshotRoot: snapshotRoot ? resolve(snapshotRoot) : undefined,
@@ -381,7 +424,7 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
   if (typeof testExecutor !== 'function') throw new Error('DSH test executor is required')
   return {
     gitAdapter,
-    async collect({ runId, round = 0, repoRoot, executorReport, baseline, signal, testCommand: requestedTestCommand }) {
+    async collect({ runId, round = 0, repoRoot, executorReport, baseline, signal, onProgress, testCommand: requestedTestCommand }) {
       throwIfAborted(signal)
       const after = await captureGitSnapshot({
         repoRoot,
@@ -389,12 +432,21 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
         snapshotRoot: baseline?.snapshotRoot,
         artifactRoot,
         snapshotName: `after-round-${round}`,
+        compareCommit: baseline?.commit,
         signal,
       })
       const delta = await diffSnapshots({ baseline, after, gitAdapter, signal })
       const [command, args] = requestedTestCommand ?? testCommand
       throwIfAborted(signal)
-      const test = await testExecutor({ runId, round, cwd: repoRoot, command, args, signal })
+      const test = await testExecutor({
+        runId,
+        round,
+        cwd: repoRoot,
+        command,
+        args,
+        signal,
+        ...(onProgress ? { onProgress } : {}),
+      })
       const changedFileNames = changedFilesBetween(baseline, after)
       const summary = {
         round,
@@ -402,7 +454,11 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
         changedFileNames,
         deltaBytes: Buffer.byteLength(delta ?? '', 'utf8'),
         baseline: { commit: baseline?.commit ?? null, dirty: Boolean(baseline?.dirty) },
-        after: { commit: after?.commit ?? null, dirty: Boolean(after?.dirty) },
+        after: {
+          commit: after?.commit ?? null,
+          dirty: Boolean(after?.dirty),
+          committedFiles: after?.committedFiles ?? [],
+        },
         test: {
           ok: test?.ok === true,
           exitCode: test?.exitCode ?? null,
@@ -431,6 +487,14 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
         mime: 'text/x-patch',
         text: delta,
         source: 'git-run-delta',
+      })
+      const history = await store.writeText({
+        runId,
+        stage: `evidence-${round}`,
+        name: 'git-history.patch',
+        mime: 'text/x-patch',
+        text: after.commitHistory ?? '',
+        source: 'git-run-history',
       })
       const testResult = await store.writeJson({
         runId,
@@ -470,8 +534,8 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
         delta,
         test,
         summary,
-        artifacts: [report, diff, testResult, summaryArtifact, baselineArtifact, afterArtifact],
-        reviewArtifacts: [report, diff, testResult, summaryArtifact],
+        artifacts: [report, diff, history, testResult, summaryArtifact, baselineArtifact, afterArtifact],
+        reviewArtifacts: [report, diff, history, testResult, summaryArtifact],
       }
     },
   }
@@ -530,9 +594,9 @@ function isInside(root, candidate) {
 }
 
 function changedFilesBetween(baseline, after) {
-  return [...new Set([...Object.keys(baseline?.fileHashes ?? {}), ...Object.keys(after?.fileHashes ?? {})])]
+  const changedWorktreeFiles = [...new Set([...Object.keys(baseline?.fileHashes ?? {}), ...Object.keys(after?.fileHashes ?? {})])]
     .filter(file => baseline?.fileHashes?.[file] !== after?.fileHashes?.[file])
-    .sort()
+  return [...new Set([...changedWorktreeFiles, ...(after?.committedFiles ?? [])])].sort()
 }
 
 function throwIfAborted(signal) {
@@ -550,6 +614,7 @@ function compactSnapshot(snapshot) {
     dirty: Boolean(snapshot?.dirty),
     files: snapshot?.files ?? [],
     fileHashes: snapshot?.fileHashes ?? {},
+    ...(snapshot?.compareCommit ? { compareCommit: snapshot.compareCommit, committedFiles: snapshot.committedFiles ?? [] } : {}),
   }
 }
 

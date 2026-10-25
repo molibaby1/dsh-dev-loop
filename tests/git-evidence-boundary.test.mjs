@@ -147,6 +147,33 @@ test('Git adapter exposes only fixed read-only operations and rejects caller com
   }
 })
 
+test('Git evidence records commit history and changed paths from validated commit ids', async t => {
+  const { repo, artifacts } = await roots(t)
+  const adapter = createGitEvidenceAdapter({ projectRoot: repo, artifactRoot: artifacts })
+  const beforeCommit = fixtureGit(repo, ['rev-parse', 'HEAD']).trim()
+  await writeFile(join(repo, 'committed.txt'), 'committed change\n')
+  fixtureGit(repo, ['add', 'committed.txt'])
+  fixtureGit(repo, ['commit', '-m', 'add committed evidence fixture'])
+  const afterCommit = fixtureGit(repo, ['rev-parse', 'HEAD']).trim()
+
+  const [history, historyFiles, committedFiles] = await Promise.all([
+    adapter({ operation: 'history', includeCommit: afterCommit, excludeCommit: beforeCommit }),
+    adapter({ operation: 'history-files', includeCommit: afterCommit, excludeCommit: beforeCommit }),
+    adapter({ operation: 'committed-files', beforeCommit, afterCommit }),
+  ])
+  assert.equal(history.exitCode, 0)
+  assert.match(history.stdout, new RegExp(afterCommit))
+  assert.match(history.stdout, /add committed evidence fixture/)
+  assert.match(history.stdout, /diff --git a\/committed\.txt b\/committed\.txt/)
+  assert.equal(historyFiles.exitCode, 0)
+  assert.deepEqual(historyFiles.stdout.split('\0').filter(Boolean), ['committed.txt'])
+  assert.equal(committedFiles.exitCode, 0)
+  assert.deepEqual(committedFiles.stdout.split('\0').filter(Boolean), ['committed.txt'])
+
+  await assert.rejects(adapter({ operation: 'history', includeCommit: `${afterCommit} --config=core.pager=sh`, excludeCommit: beforeCommit }), /full Git commit SHA/)
+  await assert.rejects(adapter({ operation: 'committed-files', beforeCommit, afterCommit: 'HEAD' }), /full Git commit SHA/)
+})
+
 test('Git read queries disable local fsmonitor, external diff, and clean-filter execution', async t => {
   const { root, repo, artifacts } = await roots(t)
   const marker = join(root, 'external-was-run')

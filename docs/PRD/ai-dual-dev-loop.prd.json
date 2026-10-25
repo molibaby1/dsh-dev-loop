@@ -34,7 +34,7 @@
       "acceptanceCriteria": [
         "An approved task executes only via the DSH Agent and its configured tools in the trusted workspace.",
         "DSH native workspace permissions and approval policy are independent of workflow plan approval; rejected or missing approval fails closed without shell or connector fallback.",
-        "No automatic commit, push, merge, reset, or clean occurs without separate express authorization."
+        "An approved task may perform the Git operations it needs within its approved project and file scope under DSH native permissions; M2 Controller adds no Git operation-category prohibition or approval, and commit history, file diffs and final Git state remain independently reviewable."
       ],
       "priority": 3,
       "passes": false
