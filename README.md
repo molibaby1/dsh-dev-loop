@@ -93,7 +93,7 @@ Reviewer decision 只接受 `ACCEPTED`、`NEEDS_FIX`、`NEEDS_REPLAN`、`DEFER` 
 /dev-loop-m2 取消当前任务
 ```
 
-本入口完成离线实现和安全回归，不代表真实 ChatGPT Web ↔ DSH Agent 交接已验收。
+离线实现和回归测试本身不能证明真实端到端验收；此后已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。当前入口仍为固定标题普通文本人工交接，不等于 ChatGPT Web 与 DSH 自动连接。
 
 ## CLI（高级/调试用法）
 
