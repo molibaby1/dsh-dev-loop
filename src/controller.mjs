@@ -9,10 +9,17 @@ import { createPreflightChecker } from './preflight.mjs'
 import { DEV_LOOP_FINGERPRINT, publicProgressEvent } from './presentation.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
-import { claimStagedM2Plan, ensureM2PlanInbox, hasStagedM2Plan } from './plan-inbox.mjs'
+import {
+  claimStagedM2Plan,
+  claimStagedM2Review,
+  ensureM2Inbox,
+  hasStagedM2Plan,
+  hasStagedM2Review,
+} from './plan-inbox.mjs'
 
 const TERMINAL_RUN_STATES = new Set(['COMPLETE', 'STOPPED', 'FAILED', 'CANCELLED'])
 const activeM2PlanInboxes = new Set()
+const activeM2ReviewInboxes = new Set()
 
 export class DevLoopController {
   constructor({ store, bridge, executor, evidenceCollector, gitAdapter, preflight, projectRoot, sessionId, mode = 'legacy', maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
@@ -498,7 +505,7 @@ export class DevLoopController {
   /** Claim the fixed Host inbox plan and submit it through the normal M2 checks. */
   async submitPendingExternalPlan({ signal, onEvent } = {}) {
     this.assertManualHandoffMode()
-    const inbox = await ensureM2PlanInbox(this.artifactRoot)
+    const inbox = await ensureM2Inbox(this.artifactRoot)
     if (activeM2PlanInboxes.has(inbox)) throw new Error('另一个 DSH 调用正在领取 M2 方案')
     activeM2PlanInboxes.add(inbox)
     try {
@@ -521,6 +528,26 @@ export class DevLoopController {
       }
     } finally {
       activeM2PlanInboxes.delete(inbox)
+    }
+  }
+
+  /** Claim a staged Reviewer result and submit it against the current Session's unique REVIEWING run. */
+  async submitPendingExternalReview() {
+    this.assertManualHandoffMode()
+    const inbox = await ensureM2Inbox(this.artifactRoot)
+    if (activeM2ReviewInboxes.has(inbox)) throw new Error('另一个 DSH 调用正在领取 M2 复审结果')
+    activeM2ReviewInboxes.add(inbox)
+    try {
+      if (!await hasStagedM2Review(this.artifactRoot)) {
+        throw new Error(`没有待领取复审结果。请将完整 JSON 写入 ${join(inbox, 'review.partial.json')}，再移动为 ${join(inbox, 'review.json')}。`)
+      }
+      const current = await this.findExternalRunForSession({ operation: 'review' })
+      const { review, sourcePath } = await claimStagedM2Review(this.artifactRoot)
+      const input = normalizeStagedExternalReview(review)
+      const result = await this.submitExternalReview({ runId: current.runId, ...input })
+      return { ...result, stagedReviewPath: sourcePath }
+    } finally {
+      activeM2ReviewInboxes.delete(inbox)
     }
   }
 
@@ -1527,6 +1554,22 @@ function normalizeExternalPlan(value) {
   if (!/^[a-f0-9]{40,64}$/i.test(normalized.observedContext.commit)) throw new Error('external plan observedContext.commit must be a Git commit SHA')
   if (plan.acceptanceCriteria !== undefined) normalized.acceptanceCriteria = requiredStringArray(plan.acceptanceCriteria, 'external plan acceptanceCriteria')
   return normalized
+}
+
+function normalizeStagedExternalReview(value) {
+  const review = assertPlainObject(value, 'staged external review')
+  const allowed = ['schema', 'receipt', 'decision', 'summary', 'findings']
+  rejectUnknownKeys(review, allowed, 'staged external review')
+  if (review.schema !== 1) throw new Error('staged external review schema must be 1')
+  if (allowed.some(key => !Object.hasOwn(review, key))) {
+    throw new Error('staged external review must contain exactly schema, receipt, decision, summary, and findings')
+  }
+  return {
+    receipt: review.receipt,
+    decision: review.decision,
+    summary: review.summary,
+    findings: review.findings,
+  }
 }
 
 function contextFromSnapshot(snapshot) {

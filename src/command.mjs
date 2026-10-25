@@ -1,4 +1,4 @@
-import { isAbsolute, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { createDshDevLoopController } from './host.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
 import { diagnosticForInput, diagnosticFromError } from './diagnostics.mjs'
@@ -186,6 +186,7 @@ export function parseDevLoopM2Input(rawInput) {
   if (!text) throw new Error('请输入完整的 Planner 交接文本或一条独立操作命令')
   const actions = new Map([
     ['领取待审方案', { action: 'claim-pending-plan' }],
+    ['领取复审结果', { action: 'claim-pending-review' }],
     ['批准当前方案', { action: 'approve-current-plan' }],
     ['查看当前状态', { action: 'status-current-task' }],
     ['取消当前任务', { action: 'cancel-current-task' }],
@@ -237,6 +238,8 @@ export async function executeDevLoopM2Command({ ctx, config = {}, invocation } =
         promise = controller.submitExternalPlan({ plan: action.plan, signal: linked.signal, onEvent })
       } else if (action.action === 'claim-pending-plan') {
         promise = controller.submitPendingExternalPlan({ signal: linked.signal, onEvent })
+      } else if (action.action === 'claim-pending-review') {
+        promise = controller.submitPendingExternalReview()
       } else {
         const operation = {
           'approve-current-plan': 'approve',
@@ -299,9 +302,9 @@ export function createDevLoopM2Command({ ctx, config = {} } = {}) {
   if (!ctx) throw new Error('DSH context is required')
   return {
     name: 'dev-loop-m2',
-    description: '领取 Host 暂存的 JSON 方案，随后用独立命令批准、查询、取消或提交复审',
+    description: '领取 Host 暂存的 JSON 方案或复审结果，随后用独立命令批准、查询或取消',
     recordInput: true,
-    input: { hint: '输入“领取待审方案”读取 Host 暂存文件，或粘贴 Planner 固定标题文本；另可批准、查询、取消或提交 Reviewer 回执' },
+    input: { hint: '输入“领取待审方案”或“领取复审结果”读取 Host 暂存文件，或粘贴 Planner/Reviewer 固定标题文本；另可批准、查询或取消' },
     handler: invocation => executeDevLoopM2Command({ ctx, config, invocation }),
   }
 }
@@ -444,12 +447,18 @@ function summarizeM2Result(result = {}) {
     if (result.handoff?.reviewReceipt) lines.push(`审核回执：${result.handoff.reviewReceipt}`)
     if (result.handoff?.evidencePath) lines.push(`证据目录：${result.handoff.evidencePath}`)
     if (result.handoff?.evidenceManifestPath) lines.push(`证据清单：${result.handoff.evidenceManifestPath}`)
+    if (result.handoff?.evidencePath) {
+      const inbox = join(dirname(result.handoff.evidencePath), '.m2-inbox')
+      lines.push(`复审结果文件：先写入 ${join(inbox, 'review.partial.json')}，再移动为 ${join(inbox, 'review.json')}`)
+      lines.push('文件就绪后，在此 DSH Session 执行“领取复审结果”。')
+    }
   }
   if (result.decision) lines.push(`Reviewer 结论：${result.decision}`)
   if (result.summary?.test?.ok === true) lines.push('测试结果：通过')
   if (result.summary?.test?.ok === false) lines.push('测试结果：未通过')
   if (Number.isSafeInteger(result.summary?.changedFiles)) lines.push(`变更文件：${result.summary.changedFiles} 个`)
   if (result.stagedPlanPath) lines.push(`已领取输入副本：${result.stagedPlanPath}`)
+  if (result.stagedReviewPath) lines.push(`已领取复审副本：${result.stagedReviewPath}`)
   if (result.diagnostic?.message) lines.push(`诊断：${result.diagnostic.message}`)
   else if (result.state === 'CANCELLED') lines.push('任务已取消。')
   return lines.join('\n')

@@ -291,6 +291,7 @@ test('M2 rejects missing, duplicate, empty, unknown, and unsafe Planner handoff 
 })
 
 test('M2 accepts only exact standalone actions and structured Reviewer receipts', () => {
+  assert.deepEqual(parseDevLoopM2Input('领取复审结果'), { action: 'claim-pending-review' })
   assert.deepEqual(parseDevLoopM2Input('批准当前方案'), { action: 'approve-current-plan' })
   assert.deepEqual(parseDevLoopM2Input('查看当前状态'), { action: 'status-current-task' })
   assert.deepEqual(parseDevLoopM2Input('取消当前任务'), { action: 'cancel-current-task' })

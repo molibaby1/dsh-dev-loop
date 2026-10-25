@@ -30,9 +30,9 @@ export function apply(ctx, config = {}) {
     })
     commandCtx.commands.register({
       name: 'dev-loop-m2',
-      description: '领取 Host 暂存的 JSON 方案，单独审批后执行，并提交绑定证据的 Reviewer 回执',
+      description: '领取 Host 暂存的 JSON 方案或复审结果，单独审批后执行',
       recordInput: true,
-      input: { hint: '输入“领取待审方案”读取 Host 暂存文件，或粘贴固定标题方案；也可批准、查询、取消或提交 Reviewer 回执' },
+      input: { hint: '输入“领取待审方案”或“领取复审结果”读取 Host 暂存文件，或粘贴固定标题方案/Reviewer 结果；也可批准、查询或取消' },
       handler: async invocation => {
         try {
           const modulePath = config.modulePath ?? 'dsh-dev-loop'

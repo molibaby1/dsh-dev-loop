@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -155,15 +155,6 @@ Planner 观察到的 commit：
 ${commit}
 DSH Agent 执行任务：
 ${executorTask}`
-}
-
-function reviewerHandoffText(receipt, { decision = 'ACCEPTED', summary = 'Verified the changed file and passing test evidence.', findings = ['无'] } = {}) {
-  return `提交复审结果
-审核回执：${receipt}
-Reviewer decision：${decision}
-复审摘要：${summary}
-发现的问题：
-${findings.map(finding => `- ${finding}`).join('\n')}`
 }
 
 async function onlyRunId(artifactRoot) {
@@ -359,9 +350,23 @@ test('M2 command runs through a Fake DSH Agent, native approval, and resumable e
   assert.ok(evidence.artifacts.some(item => item.source === 'dsh-executor'))
   assert.ok(evidence.artifacts.some(item => item.source === 'dsh-authorized-test-tool'))
 
-  const completed = await invocation(reviewerHandoffText(reviewReceipt))
+  const reviewInbox = join(await realpath(artifactRoot), '.m2-inbox')
+  assert.ok(approved.text.includes(`复审结果文件：先写入 ${join(reviewInbox, 'review.partial.json')}，再移动为 ${join(reviewInbox, 'review.json')}`))
+  await mkdir(reviewInbox, { recursive: true })
+  await writeFile(join(reviewInbox, 'review.partial.json'), `${JSON.stringify({
+    schema: 1,
+    receipt: reviewReceipt,
+    decision: 'ACCEPTED',
+    summary: 'Verified the changed file and passing test evidence.',
+    findings: [],
+  })}\n`)
+  await rename(join(reviewInbox, 'review.partial.json'), join(reviewInbox, 'review.json'))
+  const beforeReviewClaim = { adapterCalls: adapter.calls, bashExecutions }
+  const completed = await invocation('领取复审结果')
   assert.equal(completed.kind, 'success', completed.text)
   assert.match(completed.text, /状态：COMPLETE/)
+  assert.equal(adapter.calls, beforeReviewClaim.adapterCalls, 'claiming a Reviewer result must not create a DSH Agent')
+  assert.equal(bashExecutions, beforeReviewClaim.bashExecutions, 'claiming a Reviewer result must not execute the DSH Agent')
   assert.equal(adapter.calls, 4)
   assert.equal(bashExecutions, 2)
 

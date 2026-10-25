@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -13,6 +13,7 @@ import { createPreflightChecker } from '../src/preflight.mjs'
 import { apply } from '../src/plugin.mjs'
 import { apply as applyLivePlugin } from '../src/live-plugin.mjs'
 import { parseDevLoopM2Input } from '../src/command.mjs'
+import { claimStagedM2Review } from '../src/plan-inbox.mjs'
 
 const fixedPlannerText = `目标：绑定当前仓库的提交失败反馈
 修改范围：
@@ -48,6 +49,7 @@ test('plugin registers a separate manual M2 handoff command', () => {
 
   assert.deepEqual(commands.map(command => command.name), ['dev-loop', 'dev-loop-m2'])
   assert.match(commands[1].input.hint, /领取待审方案/u)
+  assert.match(commands[1].input.hint, /领取复审结果/u)
 })
 
 test('live plugin advertises the staged JSON claim command and text compatibility route', () => {
@@ -62,6 +64,7 @@ test('live plugin advertises the staged JSON claim command and text compatibilit
 
   assert.equal(commands[1].name, 'dev-loop-m2')
   assert.match(commands[1].input.hint, /领取待审方案/u)
+  assert.match(commands[1].input.hint, /领取复审结果/u)
   assert.match(commands[1].input.hint, /粘贴固定标题方案/u)
 })
 
@@ -282,6 +285,240 @@ test('a partial staged plan is not readable or claimable', async t => {
   assert.equal((await fixture.store.listRunIds()).length, 0)
   assert.equal(fixture.calls.executor, 0)
 })
+
+test('a staged Reviewer result uses the current Session REVIEWING run and existing review validation', async t => {
+  const fixture = await createFixture(t)
+  const { submitted, approved } = await createReviewingRun(fixture)
+  const input = stagedReview(approved.handoff.reviewReceipt)
+  const inbox = await stageReviewFile(fixture, input)
+  const callsBeforeReview = { ...fixture.calls }
+
+  const result = await (await fixture.createController()).submitPendingExternalReview()
+
+  assert.equal(result.state, 'COMPLETE')
+  assert.equal(result.runId, submitted.runId)
+  assert.equal(result.decision, 'ACCEPTED')
+  assert.equal(result.handoff.reviewSource, 'manual-chatgpt-web-review-relay')
+  assert.equal(fixture.calls.executor, callsBeforeReview.executor, 'receiving a review must not invoke the DSH Agent')
+  assert.equal(fixture.calls.test, callsBeforeReview.test)
+  assert.ok(result.stagedReviewPath.endsWith('.json'))
+  assert.deepEqual((await readdir(inbox)).filter(name => name.startsWith('claimed-review-')).length, 1)
+  const review = await fixture.store.readJson({ runId: submitted.runId, name: 'review.json' })
+  assert.deepEqual({ receipt: review.receipt, decision: review.decision, summary: review.summary, findings: review.findings }, {
+    receipt: input.receipt,
+    decision: input.decision,
+    summary: input.summary,
+    findings: input.findings,
+  })
+
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /没有待领取复审结果/u,
+  )
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-summary.json' })).decision, 'ACCEPTED')
+})
+
+test('a Reviewer result cannot select a Run from another DSH Session or a non-REVIEWING Run', async t => {
+  const fixture = await createFixture(t)
+  const { submitted, approved } = await createReviewingRun(fixture, { sessionId: 'session-a' })
+  const inbox = await stageReviewFile(fixture, stagedReview(approved.handoff.reviewReceipt))
+
+  await assert.rejects(
+    () => fixture.createController({ sessionId: 'session-b' }).then(controller => controller.submitPendingExternalReview()),
+    error => error.code === 'RUN_SESSION_CANDIDATE_MISSING',
+  )
+  assert.ok((await readdir(inbox)).includes('review.json'), 'wrong-session lookup leaves the staged result available')
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'REVIEWING')
+
+  const waiting = await (await fixture.createController({ sessionId: 'session-c' })).submitExternalPlan({ plan: fixture.plan })
+  await rm(join(inbox, 'review.json'))
+  await writeFile(join(inbox, 'review.json'), `${JSON.stringify(stagedReview('unused-receipt'))}\n`)
+  await assert.rejects(
+    () => fixture.createController({ sessionId: 'session-c' }).then(controller => controller.submitPendingExternalReview()),
+    error => error.code === 'RUN_SESSION_CANDIDATE_MISSING',
+  )
+  assert.equal((await fixture.store.readJson({ runId: waiting.runId, name: 'run-state.json' })).state, 'WAITING_FOR_APPROVAL')
+  assert.ok((await readdir(inbox)).includes('review.json'))
+  assert.equal(fixture.calls.executor, 1)
+})
+
+test('a staged Reviewer result with the wrong receipt is rejected by the existing Controller checks', async t => {
+  const fixture = await createFixture(t)
+  const { submitted, approved } = await createReviewingRun(fixture)
+  const inbox = await stageReviewFile(fixture, stagedReview('0'.repeat(22)))
+  const callsBeforeReview = { ...fixture.calls }
+
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    error => error.code === 'REVIEW_RECEIPT_MISMATCH',
+  )
+
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'REVIEWING')
+  assert.equal(fixture.calls.executor, callsBeforeReview.executor)
+  assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-review-')))
+  assert.notEqual(approved.handoff.reviewReceipt, '0'.repeat(22))
+})
+
+test('a staged Reviewer result is stopped when its evidence is stale', async t => {
+  const fixture = await createFixture(t)
+  const { submitted, approved } = await createReviewingRun(fixture)
+  const inbox = await stageReviewFile(fixture, stagedReview(approved.handoff.reviewReceipt))
+  await writeFile(join(fixture.projectRoot, 'reviewer-stale.txt'), 'changed after evidence\n')
+  runGit(fixture.projectRoot, ['add', 'reviewer-stale.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'change after evidence'])
+  const callsBeforeReview = { ...fixture.calls }
+
+  const result = await (await fixture.createController()).submitPendingExternalReview()
+
+  assert.equal(result.state, 'STOPPED')
+  assert.equal(result.diagnostic.code, 'EVIDENCE_STALE')
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'STOPPED')
+  assert.equal(fixture.calls.executor, callsBeforeReview.executor)
+  assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-review-')))
+})
+
+test('staged Reviewer input ignores partial files and retains malformed or unsupported input after claiming', async t => {
+  const fixture = await createFixture(t)
+  await createReviewingRun(fixture)
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  await writeFile(join(inbox, 'review.partial.json'), `${JSON.stringify(stagedReview('receipt'))}\n`)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /没有待领取复审结果/u,
+  )
+  assert.deepEqual(await readdir(inbox), ['review.partial.json'])
+
+  await writeFile(join(inbox, 'review.json'), '{ malformed')
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /已领取复审结果无效/u,
+  )
+  const malformed = (await readdir(inbox)).find(name => name.startsWith('claimed-review-'))
+  assert.equal(await readFile(join(inbox, malformed), 'utf8'), '{ malformed')
+
+  await writeFile(join(inbox, 'review.json'), `${JSON.stringify({
+    ...stagedReview('receipt'),
+    runId: 'forged-run',
+    sessionId: 'forged-session',
+    projectRoot: '/untrusted/project',
+    artifactRoot: '/untrusted/artifacts',
+    permissions: 'danger-full-access',
+    approve: true,
+    path: '/untrusted/review.json',
+  })}\n`)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /unsupported fields: runId, sessionId, projectRoot, artifactRoot, permissions, approve, path/u,
+  )
+  await writeFile(join(inbox, 'review.json'), `${JSON.stringify({ schema: 1, receipt: 'receipt' })}\n`)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /must contain exactly schema, receipt, decision, summary, and findings/u,
+  )
+  await writeFile(join(inbox, 'review.json'), `${JSON.stringify(stagedReview('receipt', { decision: 'ACCEPT' }))}\n`)
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /invalid review decision: ACCEPT/u,
+  )
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(fixture.calls.executor, 1)
+})
+
+test('staged Reviewer inbox rejects symlinked directories and result files', async t => {
+  const fixture = await createFixture(t)
+  await createReviewingRun(fixture)
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  const outside = join(fixture.root, 'outside-review.json')
+  await writeFile(outside, `${JSON.stringify(stagedReview('outside-receipt'))}\n`)
+  await symlink(outside, inbox)
+
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /regular directory/u,
+  )
+  assert.equal(await readFile(outside, 'utf8'), `${JSON.stringify(stagedReview('outside-receipt'))}\n`)
+  await rm(inbox)
+  await mkdir(inbox)
+  await symlink(outside, join(inbox, 'review.json'))
+  await assert.rejects(
+    () => fixture.createController().then(controller => controller.submitPendingExternalReview()),
+    /regular file/u,
+  )
+  assert.equal(await readFile(outside, 'utf8'), `${JSON.stringify(stagedReview('outside-receipt'))}\n`)
+  assert.equal(fixture.calls.executor, 1)
+})
+
+test('concurrent staged Reviewer claims record at most one decision', async t => {
+  const fixture = await createFixture(t)
+  const { submitted, approved } = await createReviewingRun(fixture)
+  const inbox = await stageReviewFile(fixture, stagedReview(approved.handoff.reviewReceipt))
+  const controllers = await Promise.all([fixture.createController(), fixture.createController()])
+
+  const claims = await Promise.allSettled(controllers.map(controller => controller.submitPendingExternalReview()))
+
+  assert.equal(claims.filter(claim => claim.status === 'fulfilled').length, 1)
+  assert.equal(claims.filter(claim => claim.status === 'rejected').length, 1)
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-summary.json' })).decision, 'ACCEPTED')
+  assert.equal((await readdir(inbox)).filter(name => name.startsWith('claimed-review-')).length, 1)
+  assert.equal(fixture.calls.executor, 1)
+})
+
+test('the shared file claim primitive atomically moves a staged Reviewer input once', async t => {
+  const fixture = await createFixture(t)
+  const input = stagedReview('fixture-receipt')
+  const inbox = await stageReviewFile(fixture, input)
+
+  const claims = await Promise.allSettled([
+    claimStagedM2Review(fixture.artifactRoot),
+    claimStagedM2Review(fixture.artifactRoot),
+  ])
+
+  assert.equal(claims.filter(claim => claim.status === 'fulfilled').length, 1)
+  assert.equal(claims.filter(claim => claim.status === 'rejected').length, 1)
+  assert.deepEqual(claims.find(claim => claim.status === 'fulfilled').value.review, input)
+  assert.equal((await readdir(inbox)).filter(name => name.startsWith('claimed-review-')).length, 1)
+  assert.ok(!(await readdir(inbox)).includes('review.json'))
+})
+
+test('a staged non-ACCEPTED Reviewer decision follows the existing stop strategy', async t => {
+  const fixture = await createFixture(t)
+  const { approved } = await createReviewingRun(fixture)
+  await stageReviewFile(fixture, stagedReview(approved.handoff.reviewReceipt, { decision: 'NEEDS_FIX' }))
+  const stopped = await (await fixture.createController()).submitPendingExternalReview()
+  assert.equal(stopped.state, 'STOPPED')
+  assert.equal(stopped.decision, 'NEEDS_FIX')
+  assert.equal(fixture.calls.executor, 1)
+})
+
+async function createReviewingRun(fixture, { sessionId = 'fixture-session' } = {}) {
+  const submitted = await (await fixture.createController({ sessionId })).submitExternalPlan({ plan: fixture.plan })
+  const approved = await (await fixture.createController({ sessionId })).approveExternalPlan({
+    runId: submitted.runId,
+    planSha256: submitted.handoff.planSha256,
+  })
+  return { submitted, approved }
+}
+
+function stagedReview(receipt, overrides = {}) {
+  return {
+    schema: 1,
+    receipt,
+    decision: 'ACCEPTED',
+    summary: '核对了当前 Run 的差异、测试和审核证据。',
+    findings: [],
+    ...overrides,
+  }
+}
+
+async function stageReviewFile(fixture, review) {
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox, { recursive: true })
+  const partial = join(inbox, 'review.partial.json')
+  await writeFile(partial, `${JSON.stringify(review)}\n`)
+  await rename(partial, join(inbox, 'review.json'))
+  return inbox
+}
 
 test('manual plan ownership is persisted by trusted DSH session and restored by a new Controller', async t => {
   const fixture = await createFixture(t)

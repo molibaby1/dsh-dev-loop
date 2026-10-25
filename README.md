@@ -4,7 +4,7 @@ Bounded AI dual-layer development loop for a separate project repository.
 
 ## Runtime boundary
 
-- M2 Planner and Reviewer handoffs support manual text transfer and a local Host inbox for Planner JSON; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
+- M2 Planner and Reviewer handoffs support manual text transfer and local Host inboxes for Planner JSON and Reviewer decisions; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
 - Executor uses the installed `dsh-codex-subscription` DSH provider route: `openai-codex` / `gpt-6-luna`.
 - The Executor is a DSH Agent, so DSH remains the tool, permission, session, and execution authority.
 - The M2 Controller allows Git operations required by the approved task under DSH native permissions, while keeping project and file-scope checks and giving the Reviewer commit-history, file-diff, and final-state evidence.
@@ -96,7 +96,23 @@ DSH Agent 执行任务：
 
 批准前 Controller 会重新检查方案哈希、可信项目根目录、分支和工作区状态。随后由 DSH Agent 在原生权限与审批下执行；批准任务需要的 Git 操作不再受 M2 Controller 的额外类别禁令或审批要求限制，项目路径和文件范围校验仍然生效。DSH 审批拒绝、取消、超时、审批证据缺失、测试失败或范围越界都会停止，不会切换到宿主备用执行器。执行和取证完成后进入 `REVIEWING`，命令会显示唯一审核回执、证据目录和 `evidence-manifest.json` 路径。Reviewer 可通过 `git-history.patch`、`git-diff.patch`、快照和最终 HEAD/工作区状态核验提交与代码；把回执和这些证据交给 ChatGPT Reviewer 人工检查。
 
-Reviewer 应返回审核回执、decision、摘要和发现的问题，再把其结果粘贴到 `/dev-loop-m2`。标题和 decision 值必须精确填写；无发现时写 `- 无`：
+Reviewer 现在可以通过同一个本机 `.m2-inbox` 回传决定。ChatGPT Reviewer 从当前 Run 的审核证据中读取回执并完成独立核查后，通过 Remote Desktop Commander 将以下字段写入 `review.partial.json`，再在同一目录原子移动为 `review.json`；用户随后在对应 DSH Session 执行“领取复审结果”。示例中的 `ACCEPTED` 只有在 Reviewer 独立核查后明确给出时才可填写，不是默认值：
+
+```json
+{
+  "schema": 1,
+  "receipt": "<当前 Run 的审核回执>",
+  "decision": "ACCEPTED",
+  "summary": "变更范围、测试和证据均已核对。",
+  "findings": []
+}
+```
+
+只允许上述五个字段和现有五种 decision。不得加入 Run ID、Session ID、Host 路径、权限或审批字段。Controller 从真实命令调用 Session 查找唯一的 `REVIEWING` Run，再把结果交给原 `submitExternalReview()` 校验。进入 `REVIEWING` 时，DSH 命令会显示两个绝对文件路径和领取指令。部分文件不会被读取；领取会原子改名为 `claimed-review-<UUID>.json`，输入副本保留供审计。错误 Session 或没有唯一 `REVIEWING` Run 时不会领取文件；无效回执、损坏输入或过期证据继续按现有 Controller 规则拒绝或停止。
+
+本机文件通道不认证 ChatGPT 身份；任何有权写入 Host 工件目录的本机主体都能提交输入，Controller 仍会核对当前 Run、回执、证据哈希、测试结果和项目状态。`ACCEPTED` 必须来自 Reviewer 已完成的独立核查，不能作为默认决定。
+
+固定标题文本方式继续作为兼容交接入口。用户也可以把 Reviewer 结果粘贴到 `/dev-loop-m2`；标题和 decision 值必须精确填写，无发现时写 `- 无`：
 
 ```text
 /dev-loop-m2 提交复审结果
@@ -116,7 +132,7 @@ Reviewer decision 只接受 `ACCEPTED`、`NEEDS_FIX`、`NEEDS_REPLAN`、`DEFER` 
 /dev-loop-m2 取消当前任务
 ```
 
-离线实现和回归测试本身不能证明真实端到端验收；此前已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。本机暂存只减少 Planner 方案转交步骤，不自动连接 ChatGPT Web 与 DSH，也不替代独立审批或复核。
+离线实现和回归测试本身不能证明真实端到端验收；此前已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。本机暂存减少 Planner 方案和 Reviewer 决定的人工转交步骤，但不会自动连接 ChatGPT Web 与 DSH，也不替代独立审批或复核。
 
 ## CLI（高级/调试用法）
 
