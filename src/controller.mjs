@@ -9,8 +9,10 @@ import { createPreflightChecker } from './preflight.mjs'
 import { DEV_LOOP_FINGERPRINT, publicProgressEvent } from './presentation.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 import { assertConfiguredArtifactRoot } from './artifact-root.mjs'
+import { claimStagedM2Plan, ensureM2PlanInbox, hasStagedM2Plan } from './plan-inbox.mjs'
 
 const TERMINAL_RUN_STATES = new Set(['COMPLETE', 'STOPPED', 'FAILED', 'CANCELLED'])
+const activeM2PlanInboxes = new Set()
 
 export class DevLoopController {
   constructor({ store, bridge, executor, evidenceCollector, gitAdapter, preflight, projectRoot, sessionId, mode = 'legacy', maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
@@ -491,6 +493,35 @@ export class DevLoopController {
     const result = await this.finish({ machine, artifacts, runId, baseline, plan: planResult, approval, diagnostic, preflight: preflightResult, handoff })
     notify({ kind: 'finished', state: result.state, decision: result.decision, summary: result.summary, diagnostic: result.diagnostic })
     return result
+  }
+
+  /** Claim the fixed Host inbox plan and submit it through the normal M2 checks. */
+  async submitPendingExternalPlan({ signal, onEvent } = {}) {
+    this.assertManualHandoffMode()
+    const inbox = await ensureM2PlanInbox(this.artifactRoot)
+    if (activeM2PlanInboxes.has(inbox)) throw new Error('另一个 DSH 调用正在领取 M2 方案')
+    activeM2PlanInboxes.add(inbox)
+    try {
+      if (!await hasStagedM2Plan(this.artifactRoot)) {
+        throw new Error(`没有待领取方案。请将完整 JSON 写入 ${join(inbox, 'plan.partial.json')}，再移动为 ${join(inbox, 'plan.json')}。`)
+      }
+      let active
+      try {
+        active = await this.findExternalRunForSession({ operation: 'status' })
+      } catch (error) {
+        if (error?.code !== 'RUN_SESSION_CANDIDATE_MISSING') throw error
+      }
+      if (active) throw new Error(`当前 DSH session 已有未结束的 M2 任务：${active.state}`)
+      const { plan, sourcePath } = await claimStagedM2Plan(this.artifactRoot)
+      try {
+        const result = await this.submitExternalPlan({ plan, signal, onEvent })
+        return { ...result, stagedPlanPath: sourcePath }
+      } catch (error) {
+        throw new Error(`暂存方案未能提交，输入保留于 ${sourcePath}：${error instanceof Error ? error.message : String(error)}`, { cause: error })
+      }
+    } finally {
+      activeM2PlanInboxes.delete(inbox)
+    }
   }
 
   async approveExternalPlan({ runId, planSha256, signal, onEvent } = {}) {

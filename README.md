@@ -4,7 +4,7 @@ Bounded AI dual-layer development loop for a separate project repository.
 
 ## Runtime boundary
 
-- M2 Planner and Reviewer handoffs are manual plain-text transfers between ChatGPT Web and DSH; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
+- M2 Planner and Reviewer handoffs support manual text transfer and a local Host inbox for Planner JSON; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
 - Executor uses the installed `dsh-codex-subscription` DSH provider route: `openai-codex` / `gpt-6-luna`.
 - The Executor is a DSH Agent, so DSH remains the tool, permission, session, and execution authority.
 - The M2 Controller allows Git operations required by the approved task under DSH native permissions, while keeping project and file-scope checks and giving the Reviewer commit-history, file-diff, and final-state evidence.
@@ -20,7 +20,7 @@ npm run package:fixture
 
 ## 历史兼容入口：`/dev-loop`
 
-`/dev-loop` 保留原有内置方案流，适用于已配置的 Web profile。新的人工转交流程推荐使用 `/dev-loop-m2`；它由用户把 ChatGPT 生成的固定标题文本转交给 DSH，不依赖 Bridge 或项目 ZIP。
+`/dev-loop` 保留原有内置方案流，适用于已配置的 Web profile。新的人工转交流程推荐使用 `/dev-loop-m2`；它由用户把 ChatGPT 生成的方案转交给 DSH，不依赖 Bridge 或项目 ZIP。
 
 原入口仍可接收自然语言需求：
 
@@ -37,7 +37,30 @@ npm run package:fixture
 
 ## 推荐入口：M2 普通文本人工交接
 
-`/dev-loop-m2` 是离线人工交接入口，不调用 Bridge、不生成或上传项目 ZIP。Planner 方案和 Reviewer 结论由用户从 ChatGPT Web 转交；固定标题只是普通文本协议，不认证 ChatGPT 身份。项目根目录、工件目录、测试命令和 DSH 权限来自可信 Host 配置，文本内容不能更改这些设置。
+`/dev-loop-m2` 是离线人工交接入口，不调用 Bridge、不生成或上传项目 ZIP。项目根目录、工件目录、测试命令和 DSH 权限来自可信 Host 配置，方案内容不能更改这些设置。
+
+本机 ChatGPT Web 可用 Remote Desktop Commander 将 Planner JSON 写入 Host 工件目录下固定的 `.m2-inbox`。首次在 DSH Session 中执行“领取待审方案”会创建该目录；若没有完成文件，命令错误详情会给出绝对路径。将完整方案写入 `plan.partial.json`，再在同一目录移动为 `plan.json`，随后在同一 DSH Session 再执行“领取待审方案”。目录只接受这个固定文件名；领取会先原子改名为 `claimed-<UUID>.json`，因此同一文件不能重复领取，未完成的 partial 文件也不会被读取。
+
+暂存文件是 Controller 外部方案字段的 JSON 表示：
+
+```json
+{
+  "schema": 1,
+  "summary": "修复提交失败时没有反馈的问题",
+  "scope": {
+    "includedPaths": ["src/submit.mjs", "tests/submit.test.mjs"],
+    "excludedPaths": ["src/generated.mjs"],
+    "nonGoals": ["不调整页面样式"]
+  },
+  "acceptanceCriteria": ["提交失败时显示错误信息"],
+  "executionRequirements": ["先检查现有实现，再运行配置的测试命令"],
+  "contextSources": ["GitHub dev 分支与当前工作区"],
+  "observedContext": {"branch": "dev", "commit": "<完整 Git commit SHA>"},
+  "executorTask": "为提交失败增加用户可见的错误反馈。"
+}
+```
+
+不得加入 `projectRoot`、`artifactRoot`、`sessionId`、权限或批准字段；Controller 会拒绝未知字段和越界仓库路径，并重新核对方案观察到的分支与 commit。Session ID 来自真实 DSH 命令调用上下文。成功领取后仍进入 `WAITING_FOR_APPROVAL`，不会运行 Agent；批准、执行和 Reviewer 复核仍沿用下方独立步骤。这个本机文件通道不对文件内容做 ChatGPT 身份认证；信任来源是本机文件访问权限，方案内容仍按不可信输入校验。固定标题文本继续作为兼容交接方式：
 
 先把 Planner 生成的方案整体粘贴到 `/dev-loop-m2`。以下十个标题必须各出现一次，路径必须是仓库相对路径；`修改范围` 至少列出一个路径。无排除路径或非目标时填写 `- 无`。分支和 commit 必须来自 Planner 观察到的 Git 状态：
 
@@ -93,7 +116,7 @@ Reviewer decision 只接受 `ACCEPTED`、`NEEDS_FIX`、`NEEDS_REPLAN`、`DEFER` 
 /dev-loop-m2 取消当前任务
 ```
 
-离线实现和回归测试本身不能证明真实端到端验收；此后已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。当前入口仍为固定标题普通文本人工交接，不等于 ChatGPT Web 与 DSH 自动连接。
+离线实现和回归测试本身不能证明真实端到端验收；此前已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。本机暂存只减少 Planner 方案转交步骤，不自动连接 ChatGPT Web 与 DSH，也不替代独立审批或复核。
 
 ## CLI（高级/调试用法）
 

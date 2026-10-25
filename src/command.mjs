@@ -185,6 +185,7 @@ export function parseDevLoopM2Input(rawInput) {
   const text = String(rawInput ?? '').trim()
   if (!text) throw new Error('请输入完整的 Planner 交接文本或一条独立操作命令')
   const actions = new Map([
+    ['领取待审方案', { action: 'claim-pending-plan' }],
     ['批准当前方案', { action: 'approve-current-plan' }],
     ['查看当前状态', { action: 'status-current-task' }],
     ['取消当前任务', { action: 'cancel-current-task' }],
@@ -234,6 +235,8 @@ export async function executeDevLoopM2Command({ ctx, config = {}, invocation } =
     try {
       if (action.action === 'submit-plan') {
         promise = controller.submitExternalPlan({ plan: action.plan, signal: linked.signal, onEvent })
+      } else if (action.action === 'claim-pending-plan') {
+        promise = controller.submitPendingExternalPlan({ signal: linked.signal, onEvent })
       } else {
         const operation = {
           'approve-current-plan': 'approve',
@@ -296,9 +299,9 @@ export function createDevLoopM2Command({ ctx, config = {} } = {}) {
   if (!ctx) throw new Error('DSH context is required')
   return {
     name: 'dev-loop-m2',
-    description: '提交固定标题方案，随后用独立命令批准、查询、取消或提交复审',
+    description: '领取 Host 暂存的 JSON 方案，随后用独立命令批准、查询、取消或提交复审',
     recordInput: true,
-    input: { hint: '粘贴 Planner 固定标题文本；或输入：批准当前方案 / 查看当前状态 / 取消当前任务 / 提交 Reviewer 回执文本' },
+    input: { hint: '输入“领取待审方案”读取 Host 暂存文件，或粘贴 Planner 固定标题文本；另可批准、查询、取消或提交 Reviewer 回执' },
     handler: invocation => executeDevLoopM2Command({ ctx, config, invocation }),
   }
 }
@@ -446,6 +449,7 @@ function summarizeM2Result(result = {}) {
   if (result.summary?.test?.ok === true) lines.push('测试结果：通过')
   if (result.summary?.test?.ok === false) lines.push('测试结果：未通过')
   if (Number.isSafeInteger(result.summary?.changedFiles)) lines.push(`变更文件：${result.summary.changedFiles} 个`)
+  if (result.stagedPlanPath) lines.push(`已领取输入副本：${result.stagedPlanPath}`)
   if (result.diagnostic?.message) lines.push(`诊断：${result.diagnostic.message}`)
   else if (result.state === 'CANCELLED') lines.push('任务已取消。')
   return lines.join('\n')

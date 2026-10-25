@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -226,6 +227,55 @@ test('M2 accepts the fixed-title Planner handoff as ordinary text and maps it to
       executorTask: '为提交失败添加用户可见的错误反馈。',
     },
   })
+})
+
+test('M2 accepts the exact command to claim a locally staged plan', () => {
+  assert.deepEqual(parseDevLoopM2Input('领取待审方案'), { action: 'claim-pending-plan' })
+})
+
+test('M2 claim command binds the staged plan to the invoking DSH Session and waits for approval', async t => {
+  const projectRoot = process.cwd()
+  const artifactRoot = await mkdtemp(join(tmpdir(), 'dsh-loop-m2-command-inbox-'))
+  t.after(() => rm(artifactRoot, { recursive: true, force: true }))
+  const inbox = join(artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  const session = Session.create('trusted-m2-invocation-session')
+  const plan = {
+    schema: 1,
+    summary: 'Test the fixed local inbox handoff.',
+    scope: { includedPaths: ['src/command.mjs'], excludedPaths: [], nonGoals: [] },
+    executionRequirements: ['Do not approve or execute this test plan.'],
+    contextSources: ['local Git read-only observation'],
+    observedContext: {
+      branch: execFileSync('git', ['-C', projectRoot, 'branch', '--show-current'], { encoding: 'utf8' }).trim(),
+      commit: execFileSync('git', ['-C', projectRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    },
+    executorTask: 'This is a test-only task; it must remain unexecuted.',
+    acceptanceCriteria: ['the Controller reaches WAITING_FOR_APPROVAL'],
+  }
+  await writeFile(join(inbox, 'plan.json'), `${JSON.stringify(plan)}\n`)
+  const ctx = {
+    agents: {},
+    agentPresets: { mount() {} },
+    permissionPresets: { set() {} },
+  }
+
+  const result = await executeDevLoopM2Command({
+    ctx,
+    config: { projectRoot, artifactRoot },
+    invocation: { rawInput: '领取待审方案', agent: { session } },
+  })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /WAITING_FOR_APPROVAL/u)
+  assert.match(result.text, /尚未调用 DSH Agent/u)
+  const runId = (await readdir(artifactRoot)).find(name => name !== '.m2-inbox')
+  assert.ok(runId)
+  const state = JSON.parse(await readFile(join(artifactRoot, runId, 'run-state.json'), 'utf8'))
+  const request = JSON.parse(await readFile(join(artifactRoot, runId, 'run-request.json'), 'utf8'))
+  assert.equal(state.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(request.sessionId, session.id)
+  assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-')))
 })
 
 test('M2 rejects missing, duplicate, empty, unknown, and unsafe Planner handoff fields', () => {

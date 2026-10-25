@@ -11,6 +11,7 @@ import { createEvidenceCollector, createGitEvidenceAdapter } from '../src/eviden
 import { createDshDevLoopController } from '../src/host.mjs'
 import { createPreflightChecker } from '../src/preflight.mjs'
 import { apply } from '../src/plugin.mjs'
+import { apply as applyLivePlugin } from '../src/live-plugin.mjs'
 import { parseDevLoopM2Input } from '../src/command.mjs'
 
 const fixedPlannerText = `目标：绑定当前仓库的提交失败反馈
@@ -46,6 +47,22 @@ test('plugin registers a separate manual M2 handoff command', () => {
   apply(ctx, { projectRoot: '/tmp/project', artifactRoot: '/tmp/dsh-artifacts' })
 
   assert.deepEqual(commands.map(command => command.name), ['dev-loop', 'dev-loop-m2'])
+  assert.match(commands[1].input.hint, /领取待审方案/u)
+})
+
+test('live plugin advertises the staged JSON claim command and text compatibility route', () => {
+  const commands = []
+  const ctx = {
+    inject(_dependencies, callback) {
+      callback({ commands: { register: command => commands.push(command) } })
+    },
+  }
+
+  applyLivePlugin(ctx)
+
+  assert.equal(commands[1].name, 'dev-loop-m2')
+  assert.match(commands[1].input.hint, /领取待审方案/u)
+  assert.match(commands[1].input.hint, /粘贴固定标题方案/u)
 })
 
 test('M2 handoff text cannot inline approval or override trusted Host settings', () => {
@@ -96,6 +113,174 @@ test('external plan relay persists for separate approval without ZIP, Bridge, or
   assert.ok(!files.some(file => file.endsWith('.zip')))
   const planRecord = await fixture.store.verifyJson({ runId: result.runId, name: 'plan.json', sha256: result.handoff.planSha256 })
   assert.equal(planRecord.source, 'manual-chatgpt-web-plan-relay')
+})
+
+test('a staged plan is claimed once and bound to the trusted DSH session', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController({ sessionId: 'trusted-session-from-invocation' })
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  await writeFile(join(inbox, 'plan.json'), `${JSON.stringify(fixture.plan)}\n`)
+
+  const result = await controller.submitPendingExternalPlan()
+
+  assert.equal(result.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+  const request = await fixture.store.readJson({ runId: result.runId, name: 'run-request.json' })
+  assert.equal(request.sessionId, 'trusted-session-from-invocation')
+  assert.equal((await fixture.store.readJson({ runId: result.runId, name: 'run-state.json' })).state, 'WAITING_FOR_APPROVAL')
+  assert.ok((await readdir(inbox)).some(name => /^claimed-[a-f0-9-]+\.json$/u.test(name)))
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /没有待领取方案/u)
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(fixture.calls.executor, 0)
+  const nextPlan = `${JSON.stringify(fixture.plan)}\n`
+  await writeFile(join(inbox, 'plan.json'), nextPlan)
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /已有未结束的 M2 任务/u)
+  assert.equal(await readFile(join(inbox, 'plan.json'), 'utf8'), nextPlan)
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+})
+
+test('an empty claim creates only the fixed Host inbox and reports where to stage the file', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), error => {
+    assert.match(error.message, /没有待领取方案/u)
+    assert.ok(error.message.includes(inbox))
+    assert.match(error.message, /plan\.partial\.json/u)
+    return true
+  })
+
+  assert.deepEqual(await readdir(fixture.artifactRoot), ['.m2-inbox'])
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+})
+
+test('a staged plan with stale Git context is retained as a failed Controller run without execution', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController({ sessionId: 'stale-session' })
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  await writeFile(join(inbox, 'plan.json'), `${JSON.stringify({
+    ...fixture.plan,
+    observedContext: { ...fixture.plan.observedContext, commit: '0'.repeat(40) },
+  })}\n`)
+
+  const result = await controller.submitPendingExternalPlan()
+
+  assert.equal(result.state, 'FAILED')
+  assert.equal(result.diagnostic.code, 'PLAN_CONTEXT_MISMATCH')
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+  assert.equal((await fixture.store.readJson({ runId: result.runId, name: 'run-state.json' })).state, 'FAILED')
+  assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-')))
+})
+
+test('a staged plan rejects unsafe repository paths while preserving the input', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  const unsafePlan = {
+    ...fixture.plan,
+    scope: { ...fixture.plan.scope, includedPaths: ['../outside.txt'] },
+  }
+  await writeFile(join(inbox, 'plan.json'), `${JSON.stringify(unsafePlan)}\n`)
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /safe repository-relative paths/u)
+
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  const claimedFile = (await readdir(inbox)).find(name => name.startsWith('claimed-'))
+  assert.ok(claimedFile)
+  assert.deepEqual(JSON.parse(await readFile(join(inbox, claimedFile), 'utf8')), unsafePlan)
+})
+
+test('a staged plan cannot select Host roots, Session, permissions, or approval', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  const untrustedPlan = {
+    ...fixture.plan,
+    projectRoot: '/tmp/untrusted-project',
+    sessionId: 'forged-session',
+    permissionPreset: 'danger-full-access',
+    approve: true,
+  }
+  await writeFile(join(inbox, 'plan.json'), `${JSON.stringify(untrustedPlan)}\n`)
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /unsupported fields/u)
+
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  const claimedFile = (await readdir(inbox)).find(name => name.startsWith('claimed-'))
+  assert.ok(claimedFile)
+  assert.deepEqual(JSON.parse(await readFile(join(inbox, claimedFile), 'utf8')), untrustedPlan)
+})
+
+test('a symlinked staged plan is rejected without reading its target', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  const outside = join(fixture.root, 'outside-plan.json')
+  await mkdir(inbox)
+  await writeFile(outside, `${JSON.stringify(fixture.plan)}\n`)
+  await symlink(outside, join(inbox, 'plan.json'))
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /regular file/u)
+
+  assert.equal((await readFile(outside, 'utf8')), `${JSON.stringify(fixture.plan)}\n`)
+  assert.deepEqual(await readdir(inbox), ['plan.json'])
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  assert.equal(fixture.calls.executor, 0)
+})
+
+test('a symlinked inbox directory cannot redirect the Host plan intake outside artifact storage', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  const outside = join(fixture.root, 'outside-inbox')
+  await mkdir(outside)
+  await writeFile(join(outside, 'plan.json'), `${JSON.stringify(fixture.plan)}\n`)
+  await symlink(outside, inbox)
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /regular directory/u)
+
+  assert.deepEqual(await readdir(outside), ['plan.json'])
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  assert.equal(fixture.calls.executor, 0)
+})
+
+test('malformed JSON is claimed once and retained for diagnosis', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  await writeFile(join(inbox, 'plan.json'), '{ malformed')
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /已领取方案无效/u)
+
+  const claimedFile = (await readdir(inbox)).find(name => name.startsWith('claimed-'))
+  assert.ok(claimedFile)
+  assert.equal(await readFile(join(inbox, claimedFile), 'utf8'), '{ malformed')
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  assert.equal(fixture.calls.executor, 0)
+})
+
+test('a partial staged plan is not readable or claimable', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const inbox = join(fixture.artifactRoot, '.m2-inbox')
+  await mkdir(inbox)
+  await writeFile(join(inbox, 'plan.partial.json'), `${JSON.stringify(fixture.plan)}\n`)
+
+  await assert.rejects(() => controller.submitPendingExternalPlan(), /没有待领取方案/u)
+
+  assert.deepEqual(await readdir(inbox), ['plan.partial.json'])
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  assert.equal(fixture.calls.executor, 0)
 })
 
 test('manual plan ownership is persisted by trusted DSH session and restored by a new Controller', async t => {
