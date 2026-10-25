@@ -100,3 +100,97 @@ test('DSH Codex executor propagates Agent failures and disposes its event listen
   await assert.rejects(executor.execute({ runId: 'run-error', cwd: '/repo', task: 'fail' }), /agent failed/)
   assert.deepEqual(calls, ['listener-dispose', 'handle-dispose'])
 })
+
+test('test progress pairs native approval decisions by request id in the test Agent session', async t => {
+  for (const outcome of ['allowed-once', 'rejected', 'cancelled']) {
+    await t.test(outcome, async () => {
+      const testSession = { id: 'dev-loop-run-approval-round-0-test', seq: 0 }
+      const otherSession = { id: 'unrelated-agent', seq: 0 }
+      const progress = []
+      let onSessionEvent
+      let onPreExecute
+      let releaseIdle
+      let markFollowup
+      const idle = new Promise(resolve => { releaseIdle = resolve })
+      const followedUp = new Promise(resolve => { markFollowup = resolve })
+      const agent = {
+        session: testSession,
+        followup() { markFollowup() },
+        whenIdle() { return idle },
+        cancel() {},
+      }
+      agent.ctx = {
+        on(name, callback) {
+          if (name === 'tools/pre-execute') onPreExecute = callback
+          return () => {}
+        },
+        tools: { guard: () => () => {} },
+      }
+      const executor = createDshCodexExecutor({
+        ctx: {
+          agents: { async create() { return { agent, async dispose() {} } } },
+          agentPresets: { async mount() {} },
+          permissionPresets: { set() {}, resolve: () => ({ sandbox: 'workspace-write' }) },
+          on(name, callback) {
+            assert.equal(name, 'session/event')
+            onSessionEvent = callback
+            return () => { onSessionEvent = undefined }
+          },
+        },
+        sessionIdFactory: value => value,
+        messageFactory: value => value,
+      })
+
+      const resultPromise = executor.executeTest({
+        runId: 'run-approval',
+        cwd: '/repo',
+        command: 'npm',
+        args: ['test'],
+        onProgress: event => progress.push(event),
+      })
+      await followedUp
+      const toolDecision = await onPreExecute({
+        agent,
+        name: 'bash',
+        callId: 'test-call',
+        rootCallId: 'test-root-call',
+        arguments: { description: 'Run configured tests', command: "'npm' 'test'", workdir: '/repo' },
+      }, async () => ({ kind: 'allow' }))
+      assert.equal(toolDecision.kind, 'ask')
+
+      const asked = {
+        seq: 1,
+        type: 'approval/asked',
+        data: { id: 'approval-test', toolName: 'bash', callId: 'test-call', reason: toolDecision.reason },
+      }
+      onSessionEvent(otherSession, asked)
+      onSessionEvent(testSession, asked)
+      const waiting = progress.at(-1)
+      assert.equal(waiting.status, 'waiting-for-approval')
+      assert.equal(waiting.approval.sessionId, testSession.id)
+      assert.equal(waiting.approval.operation, 'npm test')
+
+      onSessionEvent(otherSession, {
+        seq: 2,
+        type: 'approval/decided',
+        data: { id: 'approval-test', outcome },
+      })
+      assert.equal(progress.at(-1), waiting, 'another Agent session must not clear the test approval')
+
+      onSessionEvent(testSession, {
+        seq: 2,
+        type: 'approval/decided',
+        data: { id: 'approval-test', outcome },
+      })
+      assert.equal(progress.at(-1).status, 'approval-decided')
+      assert.equal(progress.at(-1).approval.outcome, outcome)
+      assert.notEqual(progress.at(-1).status, 'waiting-for-approval')
+
+      onSessionEvent(testSession, { seq: 3, type: 'turn/end', data: { reason: { kind: 'completed' } } })
+      releaseIdle()
+      const result = await resultPromise
+      assert.equal(result.approvalEvents.at(-1).data.outcome, outcome)
+      assert.equal(progress.at(-1).status, 'completed')
+    })
+  }
+})

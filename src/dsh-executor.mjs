@@ -20,11 +20,12 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
     execute({ runId, cwd, task, signal, onProgress }) {
       return runAgentTurn({ runId, cwd, task, signal, onProgress })
     },
-    async executeTest({ runId, round = 0, cwd, command, args, signal }) {
+    async executeTest({ runId, round = 0, cwd, command, args, signal, onProgress }) {
       const requestId = `${runId}:round-${round}:test`
       const capture = { requestId, runId, round, cwd, command, args, attempts: [], results: [] }
       try {
         validateTestRequest({ runId, round, cwd, command, args })
+        capture.operation = [command, ...args].join(' ')
         assertWorkspaceWriteTestPreset(ctx, permissionPreset)
         const shellCommand = [command, ...args].map(shellQuote).join(' ')
         const task = testTask({ requestId, shellCommand, cwd })
@@ -33,6 +34,7 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
           cwd,
           task,
           signal,
+          onProgress,
           sessionSuffix: `-round-${round}-test`,
           toolPolicy: capture,
         })
@@ -93,7 +95,12 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
         const events = []
         if (toolPolicy) toolPolicy.sessionEvents = events
         disposeSessionEvents = ctx.on('session/event', (session, event) => {
-          if (session === agent.session && event.seq >= firstSeq) events.push(event)
+          if (session !== agent.session || event.seq < firstSeq) return
+          events.push(event)
+          if (toolPolicy) {
+            const approvalProgress = observeTestApprovalEvent(toolPolicy, event, sessionId)
+            if (approvalProgress) onProgress?.(approvalProgress)
+          }
         })
         if (toolPolicy) {
           if (typeof agent.ctx?.on !== 'function' || typeof agent.ctx.tools?.guard !== 'function') {
@@ -157,7 +164,13 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
               : 'The Host-specified test command must receive one-time approval through DSH before execution.'
           })
         }
-        onProgress?.({ status: 'started', runId })
+        onProgress?.({
+          phase: toolPolicy ? 'test' : 'code',
+          status: 'started',
+          runId,
+          sessionId,
+          ...(toolPolicy ? { operation: toolPolicy.operation } : {}),
+        })
         agent.followup(makeMessage({
           content: [{ type: 'text', text: task }],
           source: { kind: 'user' },
@@ -166,7 +179,13 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
         if (signal?.aborted || cancelled) throw abortExecutorError()
         disposeSessionEvents()
         disposeSessionEvents = undefined
-        onProgress?.({ status: 'completed', runId })
+        onProgress?.({
+          phase: toolPolicy ? 'test' : 'code',
+          status: 'completed',
+          runId,
+          sessionId,
+          ...(toolPolicy ? { operation: toolPolicy.operation } : {}),
+        })
         return {
           runId,
           sessionId,
@@ -248,6 +267,29 @@ function hasNativeApprovalGrant(events, callId, reason) {
   return asked !== undefined && events.some(event => event.type === 'approval/decided'
     && event.data.id === asked.data.id
     && event.data.outcome === 'allowed-once')
+}
+
+function observeTestApprovalEvent(capture, event, sessionId) {
+  if (event.type === 'approval/asked'
+    && event.data?.toolName === 'bash'
+    && event.data.callId === capture.authorizedCallId
+    && event.data.reason === capture.approvalReason) {
+    capture.pendingApproval = {
+      id: event.data.id,
+      toolName: event.data.toolName,
+      callId: event.data.callId,
+      reason: event.data.reason,
+      sessionId,
+      operation: capture.operation,
+    }
+    return { phase: 'test', status: 'waiting-for-approval', approval: capture.pendingApproval }
+  }
+  if (event.type === 'approval/decided' && capture.pendingApproval?.id === event.data?.id) {
+    const approval = { ...capture.pendingApproval, outcome: event.data.outcome }
+    capture.pendingApproval = undefined
+    return { phase: 'test', status: 'approval-decided', approval }
+  }
+  return undefined
 }
 
 function testResultFromCapture(capture, turn) {

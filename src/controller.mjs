@@ -601,7 +601,7 @@ export class DevLoopController {
         cwd: this.projectRoot,
         task: externalExecutionTask(plan),
         signal,
-        onProgress: status => notify({ kind: 'progress', ...publicProgressEvent({ runId, stage: machine.state, metadata: { executor: status.status } }) }),
+        onProgress: activity => notify({ kind: 'activity', activity }),
       })
       assertSuccessfulExecutorTurn(executorReport)
       await transition('COLLECTING_EVIDENCE')
@@ -612,6 +612,7 @@ export class DevLoopController {
         executorReport,
         baseline,
         signal,
+        onProgress: activity => notify({ kind: 'activity', activity }),
       })
       evidenceSummary = evidence.summary
       const evidenceArtifacts = []

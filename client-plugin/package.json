@@ -15,7 +15,9 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-chat",
         "@deepseek-ai/dsh-client-ui-conversation",
-        "@deepseek-ai/dsh-client-ui-renderer"
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ],
       "platform": "web"
     }
@@ -25,6 +27,8 @@
     "@deepseek-ai/dsh-client-ui-chat": ">=0.2.1-rc.2",
     "@deepseek-ai/dsh-client-ui-conversation": ">=0.2.1-rc.2",
     "@deepseek-ai/dsh-client-ui-renderer": ">=0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": ">=0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-workspace": ">=0.2.1-rc.2",
     "react": ">=18.2.0"
   }
 }

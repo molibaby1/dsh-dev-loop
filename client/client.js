@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
     const React = require("react");
 
-    const CLIENT_BUILD_ID = "0.1.0-card-v1";
+    const CLIENT_BUILD_ID = "0.1.0-card-v2";
 
     const EVENT_TYPES = new Set([
       "dev-loop/run-started",
@@ -41,6 +41,7 @@ window.__ModuleLoader__.load({
     };
 
     const TERMINAL = new Set(["COMPLETE", "STOPPED", "FAILED", "CANCELLED"]);
+    const APPROVAL_SESSION_PATTERN = /^审批 Session：([A-Za-z0-9][A-Za-z0-9._-]{0,180})$/m;
 
     function contextLocation(context) {
       return context.start?.location ?? context.matches[0]?.location ?? { kind: "unresolved" };
@@ -175,6 +176,22 @@ window.__ModuleLoader__.load({
       );
     });
 
+    const DevLoopM2CommandRow = React.memo(function DevLoopM2CommandRow({ node, canOpenSession, openSession }) {
+      const text = node.outcome?.text ?? node.progress?.text ?? "";
+      const pending = text.includes("审批状态：待处理") && text.includes("等待工具审批");
+      const sessionId = pending ? APPROVAL_SESSION_PATTERN.exec(text)?.[1] : undefined;
+      const navigable = sessionId && canOpenSession?.(sessionId) === true;
+      return React.createElement("section", { className: "dshDevLoopM2Command" },
+        React.createElement("pre", null, text || "M2 命令正在运行。"),
+        navigable && typeof openSession === "function"
+          ? React.createElement("button", {
+            type: "button",
+            onClick: () => openSession(sessionId),
+          }, "打开审批 Session")
+          : sessionId ? React.createElement("p", null, "请在 DSH 会话列表中查找上方 Session ID 并处理原生审批。") : null,
+      );
+    });
+
     const css = `
 .dshDevLoopCard{border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-base);padding:16px;box-shadow:0 4px 18px rgba(0,0,0,.05)}
 .dshDevLoopCard.tone-active{border-color:var(--dsw-alias-state-business-primary)}
@@ -188,9 +205,10 @@ window.__ModuleLoader__.load({
 .dshDevLoopDiagnostic{margin-top:12px;padding:10px 12px;border-radius:8px;background:var(--dsw-specific-warning);color:var(--dsw-alias-label-primary)}.dshDevLoopDiagnostic p{margin:4px 0 0;font-size:12px;line-height:18px}
 .dshDevLoopFooter{display:flex;justify-content:space-between;gap:12px;margin-top:12px;color:var(--dsw-alias-label-caption);font-size:11px}.dshDevLoopFooter code{font-family:var(--dsw-font-family-mono,monospace)}
 .dshDevLoopTechnical{margin-top:10px;font-size:12px;color:var(--dsw-alias-label-tertiary)}.dshDevLoopTechnical summary{cursor:pointer}.dshDevLoopTechnical pre{white-space:pre-wrap;overflow:auto;max-height:240px;padding:10px;border-radius:8px;background:var(--dsw-alias-bg-l2);font-size:11px}
+.dshDevLoopM2Command pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 8px;font:inherit;color:var(--dsw-alias-label-secondary)}.dshDevLoopM2Command button{border:0;border-radius:8px;padding:7px 10px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary);cursor:pointer}
 `;
 
-    const inject = ["uiConversation", "slots"];
+    const inject = ["uiConversation", "slots", "sessions", "uiWorkspace"];
     function apply(ctx) {
       ctx.effect(() => {
         if (typeof document === "undefined" || document.querySelector('style[data-plugin-css="dsh-dev-loop"]')) return;
@@ -205,12 +223,21 @@ window.__ModuleLoader__.load({
         name: "conversation.chat.node",
         key: "dev-loop-card",
       }, DevLoopCard));
+      ctx.slots.inject("conversation.chat.commandview", () => ctx.slots.register({
+        name: "conversation.chat.commandview",
+        key: "dev-loop-m2",
+        inject: () => ({
+          canOpenSession: id => ctx.sessions.list.getSnapshot().ids.includes(id),
+          openSession: id => ctx.uiWorkspace.openSession(id),
+        }),
+      }, DevLoopM2CommandRow));
     }
 
     exports.apply = apply;
     exports.inject = inject;
     exports.definition = definition;
     exports.DevLoopCard = DevLoopCard;
+    exports.DevLoopM2CommandRow = DevLoopM2CommandRow;
     return module.exports;
   },
 });

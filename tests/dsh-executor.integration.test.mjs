@@ -172,6 +172,12 @@ async function onlyRunId(artifactRoot) {
   return runIds[0]
 }
 
+function deferred() {
+  let resolve
+  const promise = new Promise(done => { resolve = done })
+  return { promise, resolve }
+}
+
 async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(), pluginConfig = {}, testApprovalOutcome } = {}) {
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
@@ -180,7 +186,9 @@ async function createWebComposition(t, pluginEntry, { adapter = new MockAdapter(
   await mountAgentLoopTestDependencies(ctx)
   ctx.provide('shell', { sandboxMode: 'workspace-write' })
   await ctx.plugin(ApprovalService, { policy: 'ask' })
-  if (testApprovalOutcome) ctx.on('approval/request', () => testApprovalOutcome)
+  if (testApprovalOutcome) ctx.on('approval/request', request => (
+    typeof testApprovalOutcome === 'function' ? testApprovalOutcome(request) : testApprovalOutcome
+  ))
   await ctx.plugin(PermissionPresets)
   await ctx.plugin(Commands)
   await ctx.plugin(AgentPresets, { default: 'standard' })
@@ -373,6 +381,95 @@ test('M2 command runs through a Fake DSH Agent, native approval, and resumable e
   assert.equal(adapter.calls, 4)
   assert.equal(bashExecutions, 2)
   assert.equal(ctx.agents.roots().length, 1, 'only the retained command probe Agent remains')
+})
+
+test('M2 status reports a live test approval and directs it to its owning Session', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-loop-m2-live-approval-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectRoot = join(root, 'project')
+  const artifactRoot = join(root, 'artifacts')
+  await mkdir(projectRoot)
+  await writeFile(join(projectRoot, 'README.md'), 'fixture project\n')
+  fixtureGit(projectRoot, ['init', '--quiet', '--initial-branch=m2-fixture'])
+  fixtureGit(projectRoot, ['config', 'user.name', 'M2 Fixture'])
+  fixtureGit(projectRoot, ['config', 'user.email', 'm2-fixture@example.invalid'])
+  fixtureGit(projectRoot, ['add', 'README.md'])
+  fixtureGit(projectRoot, ['commit', '--quiet', '-m', 'fixture baseline'])
+  const commit = fixtureGit(projectRoot, ['rev-parse', 'HEAD'])
+  const testApprovalRequest = deferred()
+  const testApprovalDecision = deferred()
+  const adapter = new ManualHandoffAdapter({ cwd: await realpath(projectRoot) })
+  const { ctx } = await createWebComposition(t, livePlugin, {
+    adapter,
+    pluginConfig: {
+      modulePath: new URL('../src/index.mjs', import.meta.url).href,
+      projectRoot,
+      artifactRoot,
+      testCommand: ['npm', ['test']],
+    },
+    testApprovalOutcome: request => {
+      const sessionId = String(request?.agent?.session?.id ?? '')
+      if (sessionId.endsWith('-round-0-test')) {
+        testApprovalRequest.resolve(request)
+        return testApprovalDecision.promise
+      }
+      return 'allowed-once'
+    },
+  })
+  requireMainM2ToolApproval(ctx)
+  registerFakeBash(ctx, async args => {
+    if (args.command === 'write-fixture-output') await writeFile(join(args.workdir, 'result.txt'), 'fixture output\n')
+    return {
+      kind: 'foreground', cwd: args.workdir, exitCode: 0, signal: null,
+      timedOut: false, aborted: false, timeoutMs: 30_000,
+      stdout: { text: args.command === "'npm' 'test'" ? 'PASS' : 'WROTE_FIXTURE', truncated: false },
+      stderr: { text: '', truncated: false },
+      sandbox: { mode: 'workspace-write', denied: false, enforcement: 'full' },
+    }
+  })
+  const probe = await ctx.agents.create({
+    sessionId: SessionId('m2-live-approval-command-probe'),
+    setup: async agentCtx => { await ctx.agentPresets.mount(agentCtx) },
+  })
+  t.after(() => probe.dispose())
+  const invoke = async rawInput => {
+    const execution = await ctx.commands.execute(probe.agent, `/dev-loop-m2 ${rawInput}`, [], new AbortController().signal)
+    assert.ok(execution)
+    return execution.result
+  }
+
+  const submitted = await invoke(plannerHandoffText({ commit }))
+  assert.equal(submitted.kind, 'success', submitted.text)
+  const runId = await onlyRunId(artifactRoot)
+  const approvalExecution = invoke('批准当前方案')
+  try {
+    const observation = await Promise.race([
+      testApprovalRequest.promise.then(request => ({ kind: 'asked', request })),
+      approvalExecution.then(result => ({ kind: 'settled', result })),
+    ])
+    assert.equal(observation.kind, 'asked', `M2 completed before the test Agent asked for approval: ${observation.result?.text ?? ''}`)
+    const request = observation.request
+    const testSessionId = String(request.agent.session.id)
+    assert.equal(testSessionId, `dev-loop-${runId}-round-0-test`)
+
+    const status = await invoke('查看当前状态')
+    assert.match(status.text, /状态：COLLECTING_EVIDENCE/)
+    assert.match(status.text, /等待工具审批/)
+    assert.match(status.text, /npm test/)
+    assert.match(status.text, new RegExp(testSessionId))
+
+    testApprovalDecision.resolve('allowed-once')
+    const approved = await approvalExecution
+    assert.equal(approved.kind, 'success', approved.text)
+    assert.match(approved.text, /状态：REVIEWING/)
+    assert.match(approved.text, /测试结果：通过/)
+    const refreshedStatus = await invoke('查看当前状态')
+    assert.match(refreshedStatus.text, /状态：REVIEWING/)
+    assert.doesNotMatch(refreshedStatus.text, /等待工具审批|审批 Session：/)
+  } finally {
+    testApprovalDecision.resolve('allowed-once')
+    await approvalExecution.catch(() => {})
+  }
 })
 
 test('M2 native DSH approval rejection and cancellation stop before the project tool executes', async t => {

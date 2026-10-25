@@ -47,6 +47,8 @@ function createClientContext() {
   const pendingInjections = []
   const entries = new Set()
   const injectedSlots = []
+  const openedSessionIds = []
+  const listedSessionIds = new Set()
   let definition
   const context = {
     effect(callback) {
@@ -62,6 +64,10 @@ function createClientContext() {
         },
       },
     },
+    sessions: {
+      list: { getSnapshot() { return { ids: [...listedSessionIds] } } },
+    },
+    uiWorkspace: { openSession(id) { openedSessionIds.push(id) } },
     slots: {
       inject(name, callback) {
         injectedSlots.push(name)
@@ -91,6 +97,8 @@ function createClientContext() {
     get definition() { return definition },
     entries,
     injectedSlots,
+    openedSessionIds,
+    listedSessionIds,
     effects,
     pendingInjections,
   }
@@ -103,15 +111,20 @@ function elementText(element) {
   return ''
 }
 
-test('client manifest injects the DSH chat, conversation, and renderer providers', async () => {
+test('client manifest injects only installed DSH modules required for chat, sessions, and navigation', async () => {
   const manifest = JSON.parse(await readFile(new URL('../client-plugin/package.json', import.meta.url), 'utf8'))
 
   assert.deepEqual(manifest.dsh.client.inject, [
     '@deepseek-ai/dsh-client-ui-chat',
     '@deepseek-ai/dsh-client-ui-conversation',
     '@deepseek-ai/dsh-client-ui-renderer',
+    '@deepseek-ai/dsh-api-session-controller',
+    '@deepseek-ai/dsh-client-ui-workspace',
   ])
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-api-session-controller'], '>=0.2.1-rc.2')
+  assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-client-ui-workspace'], '>=0.2.1-rc.2')
   assert.equal('@deepseek-ai/dsh-client-runtime' in manifest.peerDependencies, false)
+  assert.equal(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-runtime'), false)
   for (const dependency of manifest.dsh.client.inject) {
     assert.equal(dependency in manifest.peerDependencies, true)
   }
@@ -121,20 +134,95 @@ test('client plugin registers with current DSH services and releases registratio
   const { plugin, styles } = await loadClientPlugin()
   const client = createClientContext()
 
-  assert.deepEqual([...plugin.inject].sort(), ['slots', 'uiConversation'].sort())
+  assert.deepEqual([...plugin.inject].sort(), ['sessions', 'slots', 'uiConversation', 'uiWorkspace'].sort())
   plugin.apply(client.context)
   assert.equal(client.definition.kind, 'dev-loop-run')
   assert.equal(styles.size, 1)
 
   for (const inject of client.pendingInjections) inject()
-  assert.deepEqual(client.injectedSlots, ['conversation.chat.node'])
-  assert.equal(client.entries.size, 1)
-  assert.equal([...client.entries][0].config.key, 'dev-loop-card')
+  assert.deepEqual(client.injectedSlots, ['conversation.chat.node', 'conversation.chat.commandview'])
+  assert.equal(client.entries.size, 2)
+  assert.ok([...client.entries].some(entry => entry.config.key === 'dev-loop-card'))
+  assert.ok([...client.entries].some(entry => entry.config.key === 'dev-loop-m2'))
 
   for (const dispose of [...client.effects].reverse()) dispose()
   assert.equal(client.definition, undefined)
   assert.equal(client.entries.size, 0)
   assert.equal(styles.size, 0)
+})
+
+test('M2 command row opens only the Session named by a live pending-approval progress update', async () => {
+  const { plugin } = await loadClientPlugin()
+  const client = createClientContext()
+  plugin.apply(client.context)
+  client.pendingInjections.forEach(inject => inject())
+  const row = [...client.entries].find(entry => entry.config.key === 'dev-loop-m2')
+  const injected = row.config.inject()
+  const sessionId = 'dev-loop-run-ui-round-0-test'
+  client.listedSessionIds.add(sessionId)
+  const rendered = row.component({
+    node: {
+      name: 'dev-loop-m2',
+      progress: { text: `状态：COLLECTING_EVIDENCE\n审批状态：待处理\n等待工具审批\n审批操作：bash（npm test）\n审批 Session：${sessionId}` },
+      outcome: null,
+    },
+    ...injected,
+  })
+  const findButton = element => {
+    if (element === null || typeof element !== 'object') return undefined
+    if (element?.type === 'button') return element
+    const children = element?.props?.children
+    for (const child of Array.isArray(children) ? children : [children]) {
+      const button = findButton(child)
+      if (button) return button
+    }
+    return undefined
+  }
+  const button = findButton(rendered)
+  assert.ok(button)
+  assert.match(elementText(button), /打开审批 Session/)
+  button.props.onClick()
+  assert.deepEqual(client.openedSessionIds, [sessionId])
+
+  client.listedSessionIds.clear()
+  const unavailable = row.component({
+    node: {
+      name: 'dev-loop-m2',
+      outcome: { text: `审批状态：待处理\n等待工具审批\n审批操作：bash（npm test）\n审批 Session：${sessionId}` },
+      progress: null,
+    },
+    ...injected,
+  })
+  assert.equal(findButton(unavailable), undefined)
+  assert.match(elementText(unavailable), /请在 DSH 会话列表中查找/)
+
+  const settled = row.component({
+    node: { name: 'dev-loop-m2', progress: { text: '测试 Agent 已收到允许结果，正在完成测试。' }, outcome: null },
+    ...injected,
+  })
+  assert.equal(findButton(settled), undefined)
+})
+
+test('restored M2 command row hides stale approval progress after a final outcome', async () => {
+  const { plugin } = await loadClientPlugin()
+  const client = createClientContext()
+  plugin.apply(client.context)
+  client.pendingInjections.forEach(inject => inject())
+  const row = [...client.entries].find(entry => entry.config.key === 'dev-loop-m2')
+  const injected = row.config.inject()
+  const rendered = row.component({
+    node: {
+      name: 'dev-loop-m2',
+      progress: { text: '审批状态：待处理\n等待工具审批\n审批操作：bash（npm test）\n审批 Session：dev-loop-run-ui-round-0-test' },
+      outcome: { text: '状态：COMPLETE\n测试结果：通过\n变更文件：2 个\nReviewer 结论：ACCEPTED' },
+    },
+    ...injected,
+  })
+
+  assert.match(elementText(rendered), /状态：COMPLETE/)
+  assert.match(elementText(rendered), /Reviewer 结论：ACCEPTED/)
+  assert.doesNotMatch(elementText(rendered), /审批状态：待处理|等待工具审批|审批 Session：/)
+  assert.doesNotMatch(elementText(rendered), /打开审批 Session/)
 })
 
 test('client definition assembles dev-loop events by runId and renders terminal summary', async () => {
