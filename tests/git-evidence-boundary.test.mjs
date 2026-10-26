@@ -147,6 +147,21 @@ test('Git adapter exposes only fixed read-only operations and rejects caller com
   }
 })
 
+test('Git worktree evidence does not attest repository metadata changes', async t => {
+  const { repo, artifacts } = await roots(t)
+  const adapter = createGitEvidenceAdapter({ projectRoot: repo, artifactRoot: artifacts })
+  const beforeStatus = await adapter({ operation: 'status' })
+  const beforeFiles = await adapter({ operation: 'files' })
+
+  fixtureGit(repo, ['config', '--local', 'user.name', 'Changed outside the worktree'])
+
+  const afterStatus = await adapter({ operation: 'status' })
+  const afterFiles = await adapter({ operation: 'files' })
+  assert.equal(beforeStatus.stdout, afterStatus.stdout)
+  assert.equal(beforeFiles.stdout, afterFiles.stdout)
+  assert.ok(!afterFiles.stdout.includes('.git/'))
+})
+
 test('Git evidence records commit history and changed paths from validated commit ids', async t => {
   const { repo, artifacts } = await roots(t)
   const adapter = createGitEvidenceAdapter({ projectRoot: repo, artifactRoot: artifacts })

@@ -691,29 +691,41 @@ test('test execution uses one scoped DSH bash result and waits for native approv
   assert.equal(executions, 1)
 })
 
-test('test execution refuses a trusted full-access preset before requesting model or tool work', async t => {
-  const adapter = new MockAdapter()
+test('a trusted elevated Executor preset does not disable the separately sandboxed approved test', async t => {
+  const adapter = new MockAdapter({ toolCall: {
+    id: 'elevated-preset-test-call', name: 'bash',
+    arguments: { description: 'Run the configured tests', command: "'npm' 'test'", workdir: '/tmp' },
+  } })
   const { ctx } = await createWebComposition(t, plugin, {
     adapter,
     pluginConfig: { permissionPreset: 'danger-full-access' },
+    testApprovalOutcome: 'allowed-once',
+  })
+  let session
+  ctx.on('session/created', created => {
+    if (created.id === 'dev-loop-test-evidence-full-access-preset-round-0-test') session = created
   })
   let executions = 0
   registerFakeBash(ctx, async () => {
     executions += 1
-    return { kind: 'foreground', exitCode: 0, sandbox: { mode: 'danger-full-access' } }
+    return {
+      kind: 'foreground', cwd: '/tmp', exitCode: 0, timedOut: false, aborted: false,
+      stdout: { text: 'PASS', truncated: false }, stderr: { text: '', truncated: false },
+      sandbox: { mode: 'workspace-write', denied: false, enforcement: 'full' },
+    }
   })
 
   const result = await ctx.dshDevLoopExecutor.executeTest({
     runId: 'test-evidence-full-access-preset', round: 0, cwd: '/tmp', command: 'npm', args: ['test'],
   })
 
-  assert.equal(result.ok, false)
-  assert.equal(result.errorCode, 'TEST_SANDBOX_UNAVAILABLE')
-  assert.match(result.failureReason, /workspace-write sandbox/)
-  assert.equal(adapter.calls, 0)
-  assert.equal(executions, 0)
-  assert.equal(result.attempts.length, 0)
-  assert.equal(ctx.agents.roots().length, 0)
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(adapter.calls, 2)
+  assert.equal(executions, 1)
+  assert.equal(ctx.permissionPresets.current(session), 'workspace-write')
+  assert.equal(ctx.sessionProjections.stateOf(session, 'permissions').approval, 'ask')
+  assert.deepEqual(result.approvalEvents.map(event => event.type), ['approval/asked', 'approval/decided'])
+  assert.equal(result.approvalEvents[1].data.outcome, 'allowed-once')
 })
 
 test('test execution rejection by native approval never becomes passing evidence', async t => {

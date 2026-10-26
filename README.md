@@ -8,6 +8,8 @@ Bounded AI dual-layer development loop for a separate project repository.
 - Executor uses the installed `dsh-codex-subscription` DSH provider route: `openai-codex` / `gpt-6-luna`.
 - The Executor is a DSH Agent, so DSH remains the tool, permission, session, and execution authority.
 - The M2 Controller allows Git operations required by the approved task under DSH native permissions, while keeping project and file-scope checks and giving the Reviewer commit-history, file-diff, and final-state evidence.
+- The development Agent uses the trusted Host `permissionPreset`; the separate test Agent always requests DSH `workspace-write` and still requires its own native one-time tool approval. This does not grant or imply a wider project permission.
+- M2 scope paths are repository-relative. Current Git/worktree evidence observes repository-visible paths and selected commit/status/diff data; it does not prove the absence of arbitrary effects outside the repository or all changes to `.git` internals (for example, reflogs, hooks, or local configuration). Such effects are not authorized by repository scope and must not be treated as compliant merely because the captured file list is in scope. A formal cross-workspace authorization and Git-metadata evidence contract remains undecided; M2 does not claim to enforce or attest either.
 
 ## Development
 

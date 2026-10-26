@@ -26,7 +26,6 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
       try {
         validateTestRequest({ runId, round, cwd, command, args })
         capture.operation = [command, ...args].join(' ')
-        assertWorkspaceWriteTestPreset(ctx, permissionPreset)
         const shellCommand = [command, ...args].map(shellQuote).join(' ')
         const task = testTask({ requestId, shellCommand, cwd })
         const turn = await runAgentTurn({
@@ -86,7 +85,7 @@ export function createDshCodexExecutor({ ctx, provider = EXECUTOR_PROVIDER, mode
       let disposeTestGuard
       try {
         if (ctx.permissionPresets?.set) {
-          ctx.permissionPresets.set(agent.session, permissionPreset)
+          ctx.permissionPresets.set(agent.session, toolPolicy ? 'workspace-write' : permissionPreset)
         } else {
           throw new Error('DSH permission preset service is required for Executor')
         }
@@ -212,22 +211,6 @@ function validateTestRequest({ runId, round, cwd, command, args }) {
   if (typeof cwd !== 'string' || !cwd.startsWith('/')) throw new Error('test cwd must be an absolute path')
   if (typeof command !== 'string' || command.trim() === '' || command.includes('\0')) throw new Error('test command must be a non-empty executable')
   if (!Array.isArray(args) || args.some(argument => typeof argument !== 'string' || argument.includes('\0'))) throw new Error('test args must be strings without NUL bytes')
-}
-
-function assertWorkspaceWriteTestPreset(ctx, presetName) {
-  const presets = ctx.permissionPresets ?? ctx.get?.('permissionPresets')
-  if (typeof presets?.resolve !== 'function') {
-    throw testSandboxUnavailable('DSH permission preset resolution is required for test execution')
-  }
-  if (presets.resolve(presetName).sandbox !== 'workspace-write') {
-    throw testSandboxUnavailable('test execution requires the DSH workspace-write sandbox')
-  }
-}
-
-function testSandboxUnavailable(message) {
-  const error = new Error(message)
-  error.code = 'TEST_SANDBOX_UNAVAILABLE'
-  return error
 }
 
 function testTask({ requestId, shellCommand, cwd }) {
