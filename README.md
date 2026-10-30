@@ -4,7 +4,7 @@ Bounded AI dual-layer development loop for a separate project repository.
 
 ## Runtime boundary
 
-- M2 Planner and Reviewer handoffs support manual text transfer and local Host inboxes for Planner JSON and Reviewer decisions; the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
+- M2 external Planner submission can target an existing DSH Web Session through the local Host Remote API; manual text and Host inbox handoffs remain available for compatibility, while the historical `/dev-loop` flow still uses DSH-Brain-Bridge ChatGPT Web transport with validated local attachments.
 - Executor uses the installed `dsh-codex-subscription` DSH provider route: `openai-codex` / `gpt-6-luna`.
 - The Executor is a DSH Agent, so DSH remains the tool, permission, session, and execution authority.
 - The M2 Controller allows Git operations required by the approved task under DSH native permissions, while keeping project and file-scope checks and giving the Reviewer commit-history, file-diff, and final-state evidence.
@@ -19,6 +19,44 @@ npm run package:fixture
 ```
 
 `npm test` uses only fake Bridge/Executor/CDP seams. It does not consume ChatGPT or Codex quota.
+
+## 阶段 A：提交到现有 DSH Web Session
+
+完整调用契约、请求文件字段和失败恢复见 [M2 Web Handoff 操作规范 v0.1](docs/m2-web-handoff.md)。
+
+ChatGPT Web 可准备完整请求文件，再由 Remote Desktop Commander 在本机运行一次命令。CLI 连接已经启动的 DSH `web` profile 默认地址 `127.0.0.1:3080`，先用受保护文件中的当前启动令牌调用 `GET /connect?token=…&interactions=none`，再通过 Host 的 `session/list`、`commands/list` 和 `commands/execute` 选择现有 Session 并调用 `/dev-loop-m2`。若 Web Host 使用其他 loopback 端口，可加 `--port`；不支持远程地址。
+
+首次配置时，从当前 DSH Web 启动 URL 取出 `token` 值，单独保存到项目目录之外的文件；不要把 token 写入命令参数或 shell 历史。可在 zsh 中隐藏输入并写入受限文件：
+
+```zsh
+mkdir -p -m 700 "$HOME/.config/dsh-dev-loop"
+chmod 700 "$HOME/.config/dsh-dev-loop"
+read -rs "DSH_WEB_TOKEN?输入当前 dsh web 启动 URL 中的 token: "
+printf '\n'
+umask 077
+printf '%s\n' "$DSH_WEB_TOKEN" > "$HOME/.config/dsh-dev-loop/web-startup-token"
+unset DSH_WEB_TOKEN
+chmod 600 "$HOME/.config/dsh-dev-loop/web-startup-token"
+```
+
+token 文件必须属于当前用户，权限只允许所有者访问。CLI 每次提交都用它交换签名 API Cookie；Cookie 默认有效期 30 天，但只保留在本次进程内。Host 重启后启动令牌会变化；旧文件会得到 401，需用新启动 URL 更新文件。
+
+```bash
+node bin/dsh-dev-loop.mjs m2 submit \
+  --profile web \
+  --project-root /absolute/path/to/project \
+  --session-id <existing-dsh-session-id> \
+  --request-file /absolute/path/to/m2-request.json \
+  --token-file "$HOME/.config/dsh-dev-loop/web-startup-token"
+```
+
+这些值分别指 DSH Web profile、目标代码仓库、现存 DSH Session、ChatGPT 准备的请求文件和 DSH 启动令牌文件。进程当前工作目录不参与项目选择。CLI 通过官方 `session/list` 读取 Host 保存的 Session `cwd`，要求其规范化路径等于 `--project-root`；DSH 按该 Host 路径归属 Workspace。Host 命令随后再次将真实 `invocation.agent.session.header.cwd` 与可信 Host 配置的 `projectRoot` 比较。Host 配置的工件目录、测试命令和权限不能由请求文件或 CLI 参数覆盖。Session 不存在、`cwd` 不匹配、M2 命令未安装或归属无法核对时都会拒绝；CLI 不创建 Session。
+
+请求文件由 ChatGPT Web 自动准备，外层字段为 `schema: 1`、可重试的 `requestId`、来源 `source` 和现有 M2 Plan Schema 的 `plan`。可选的 `source.conversationUrl` 只记录来源；它不用于读取或回复对话，也不构成身份或授权。CLI 与 Host 都校验文件为绝对路径下的常规文件、限制为 1 MiB、校验 UTF-8、SHA-256 和 Plan 字段，并拒绝越界仓库相对路径。完整任务只从文件读取，不放进本机 shell 命令参数。
+
+成功时 stdout 返回 JSON 回执，至少包含实际 `runId`、`sessionId`、`state: "WAITING_FOR_APPROVAL"`、可信 `projectRoot` 和实际保存的 `planSha256`。相同 `requestId` 和内容重试会返回原回执；同一 ID 对应不同内容或目标会拒绝。若首次响应不确定，重试先核对持久化记录；记录不完整时会报无法确认，并且不会再建 Run。同一 Session 已有未完成的 M2 Run 时，新请求也会被拒绝。
+
+提交只保存方案并等待独立批准，不启动开发 Agent、测试 Agent 或 Reviewer，也不修改项目代码。普通 `/dev-loop-m2` 文本、批准、取消和复审流程保持独立。
 
 ## 历史兼容入口：`/dev-loop`
 
@@ -37,7 +75,7 @@ npm run package:fixture
 /dev-loop approve run-xxxxxxxx
 ```
 
-## 推荐入口：M2 普通文本人工交接
+## 兼容入口：M2 手工交接与 Host inbox
 
 `/dev-loop-m2` 是离线人工交接入口，不调用 Bridge、不生成或上传项目 ZIP。项目根目录、工件目录、测试命令和 DSH 权限来自可信 Host 配置，方案内容不能更改这些设置。
 
@@ -134,7 +172,7 @@ Reviewer decision 只接受 `ACCEPTED`、`NEEDS_FIX`、`NEEDS_REPLAN`、`DEFER` 
 /dev-loop-m2 取消当前任务
 ```
 
-离线实现和回归测试本身不能证明真实端到端验收；此前已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。本机暂存减少 Planner 方案和 Reviewer 决定的人工转交步骤，但不会自动连接 ChatGPT Web 与 DSH，也不替代独立审批或复核。
+离线实现和回归测试本身不能证明真实端到端验收；此前已经通过一次实际的 ChatGPT Web Planner → DSH Agent/原生工具测试 → ChatGPT Web Reviewer 闭环（`run-bbbd7494-2527-4566-968e-dcdc9e7cc882`，`COMPLETE / ACCEPTED`）。阶段 A 的 CLI 让本机命令调用已运行的 Web Host，但不包含 ChatGPT Skill、不自动触发命令，也不替代独立审批或复核。
 
 ## CLI（高级/调试用法）
 
