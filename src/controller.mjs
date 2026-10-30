@@ -18,8 +18,11 @@ import {
 } from './plan-inbox.mjs'
 
 const TERMINAL_RUN_STATES = new Set(['COMPLETE', 'STOPPED', 'FAILED', 'CANCELLED'])
+const MANUAL_HANDOFF_SOURCES = new Set(['manual-chatgpt-web-plan-relay', 'chatgpt-web-cli-request'])
+const CHATGPT_WEB_CLI_SOURCE = 'chatgpt-web-cli-request'
 const activeM2PlanInboxes = new Set()
 const activeM2ReviewInboxes = new Set()
+const activeM2ExternalSubmissions = new Set()
 
 export class DevLoopController {
   constructor({ store, bridge, executor, evidenceCollector, gitAdapter, preflight, projectRoot, sessionId, mode = 'legacy', maxFixes = 1, runIdFactory = () => `run-${randomUUID()}` } = {}) {
@@ -362,19 +365,28 @@ export class DevLoopController {
     }
   }
 
-  async submitExternalPlan({ plan: submittedPlan, signal, onEvent } = {}) {
+  async submitExternalPlan({ plan: submittedPlan, runId: requestedRunId, requestId, sourceMetadata, requestFingerprint, requestFileSha256, reservationArtifact, signal, onEvent } = {}) {
     this.assertManualHandoffMode()
     const sessionId = assertDshSessionId(this.sessionId)
     const plan = normalizeExternalPlan(submittedPlan)
-    const runId = this.runIdFactory()
+    if (requestedRunId !== undefined) {
+      requestId = normalizeExternalRequestId(requestId)
+      if (requestedRunId !== `m2-${hashText(requestId)}`) throw new Error('external M2 runId is derived from requestId')
+      sourceMetadata = normalizeExternalSourceMetadata(sourceMetadata)
+      if (!/^[a-f0-9]{64}$/u.test(requestFingerprint ?? '')) throw new Error('external request fingerprint must be a SHA-256 hex digest')
+      requestFileSha256 = normalizeSha256(requestFileSha256, 'request file SHA-256')
+    }
+    const runId = requestedRunId ?? this.runIdFactory()
     const machine = new RunStateMachine({ runId, maxFixes: this.maxFixes })
-    const artifacts = []
+    const artifacts = reservationArtifact ? [reservationArtifact] : []
     const artifactRoot = this.store.root ?? this.store.configuredRoot
     const evidencePath = join(artifactRoot, runId)
+    const handoffSource = sourceMetadata ? CHATGPT_WEB_CLI_SOURCE : 'manual-chatgpt-web-plan-relay'
     const handoff = {
       mode: 'manual-handoff',
-      source: 'manual-chatgpt-web-plan-relay',
+      source: handoffSource,
       evidencePath,
+      ...(requestId === undefined ? {} : { requestId }),
     }
     const notify = event => {
       const value = { runId, at: new Date().toISOString(), fingerprint: DEV_LOOP_FINGERPRINT, ...event }
@@ -439,11 +451,17 @@ export class DevLoopController {
         value: {
           schema: 1,
           runId,
-          source: 'manual-chatgpt-web-plan-relay',
+          source: handoffSource,
           receivedAt: new Date().toISOString(),
           plan,
+          ...(requestId === undefined ? {} : {
+            requestId,
+            sourceMetadata,
+            requestFingerprint,
+            requestFileSha256,
+          }),
         },
-        source: 'manual-chatgpt-web-plan-relay',
+        source: handoffSource,
       }))
       handoff.planSha256 = planRecord.sha256
       handoff.planPath = join(evidencePath, 'plan.json')
@@ -456,10 +474,16 @@ export class DevLoopController {
           schema: 1,
           mode: 'manual-handoff',
           runId,
-          source: 'manual-chatgpt-web-plan-relay',
+          source: handoffSource,
           projectRoot: this.projectRoot,
           artifactRoot,
           sessionId,
+          ...(requestId === undefined ? {} : {
+            requestId,
+            sourceMetadata,
+            requestFingerprint,
+            requestFileSha256,
+          }),
           planSha256: planRecord.sha256,
           baselineSha256: baselineArtifact.sha256,
           projectState: observedProject,
@@ -469,7 +493,7 @@ export class DevLoopController {
       handoff.requestSha256 = request.sha256
       planResult = {
         schema: 1,
-        source: 'manual-chatgpt-web-plan-relay',
+        source: handoffSource,
         sha256: planRecord.sha256,
         plan,
         artifact: exposeArtifact(planRecord),
@@ -483,6 +507,16 @@ export class DevLoopController {
         source: 'controller-default-deny',
         planSha256: planRecord.sha256,
       }, 'controller')
+      if (requestId !== undefined) {
+        await addJson('request', 'm2-submit-receipt.json', {
+          runId,
+          requestId,
+          sessionId,
+          state: 'WAITING_FOR_APPROVAL',
+          projectRoot: this.projectRoot,
+          planSha256: planRecord.sha256,
+        }, 'controller')
+      }
     } catch (error) {
       const cancelled = isAbortError(error, signal)
       diagnostic = diagnosticFromError(error, {
@@ -500,6 +534,78 @@ export class DevLoopController {
     const result = await this.finish({ machine, artifacts, runId, baseline, plan: planResult, approval, diagnostic, preflight: preflightResult, handoff })
     notify({ kind: 'finished', state: result.state, decision: result.decision, summary: result.summary, diagnostic: result.diagnostic })
     return result
+  }
+
+  /** Persist one external request idempotently and return its durable M2 receipt. */
+  async submitExternalPlanOnce({ plan: submittedPlan, requestId: requestedRequestId, source: requestedSource, requestFileSha256: requestedFileSha256, signal, onEvent } = {}) {
+    this.assertManualHandoffMode()
+    const sessionId = assertDshSessionId(this.sessionId)
+    const requestId = normalizeExternalRequestId(requestedRequestId)
+    const sourceMetadata = normalizeExternalSourceMetadata(requestedSource)
+    const plan = normalizeExternalPlan(submittedPlan)
+    const requestFileSha256 = normalizeSha256(requestedFileSha256, 'request file SHA-256')
+    const requestFingerprint = hashJson({ requestId, sourceMetadata, plan, sessionId, projectRoot: this.projectRoot })
+    const runId = `m2-${hashText(requestId)}`
+    const activeKey = `${this.store.root ?? this.store.configuredRoot}\u0000${sessionId}`
+    if (activeM2ExternalSubmissions.has(activeKey)) {
+      throw new DevLoopError('EXTERNAL_REQUEST_IN_PROGRESS', `当前 DSH session 正在提交另一个 M2 方案：${sessionId}`)
+    }
+    activeM2ExternalSubmissions.add(activeKey)
+    try {
+      const existingRunIds = await this.store.listRunIds()
+      if (existingRunIds.includes(runId)) {
+        return await readExternalSubmissionReceipt(this.store, {
+          runId,
+          requestId,
+          requestFingerprint,
+          sessionId,
+          projectRoot: this.projectRoot,
+          deduplicated: true,
+        })
+      }
+
+      try {
+        const active = await this.findExternalRunForSession({ operation: 'status' })
+        throw new DevLoopError('RUN_SESSION_ALREADY_ACTIVE', `当前 DSH session 已有未结束的 M2 任务：${active.state}`)
+      } catch (error) {
+        if (error?.code !== 'RUN_SESSION_CANDIDATE_MISSING') throw error
+      }
+
+      const reservationArtifact = await finalizeArtifact(await this.store.writeJsonOnce({
+        runId,
+        stage: 'request',
+        name: 'external-request.json',
+        value: { schema: 1, runId, requestId, requestFingerprint, sessionId, projectRoot: this.projectRoot },
+        source: 'controller-request-reservation',
+      }))
+      const result = await this.submitExternalPlan({
+        plan,
+        runId,
+        requestId,
+        sourceMetadata,
+        requestFingerprint,
+        requestFileSha256,
+        reservationArtifact,
+        signal,
+        onEvent,
+      })
+      if (result.state !== 'WAITING_FOR_APPROVAL') {
+        throw new DevLoopError(
+          'EXTERNAL_REQUEST_SUBMISSION_FAILED',
+          `M2 方案未进入 WAITING_FOR_APPROVAL；requestId=${requestId}，runId=${runId}，state=${result.state}`,
+        )
+      }
+      return await readExternalSubmissionReceipt(this.store, {
+        runId,
+        requestId,
+        requestFingerprint,
+        sessionId,
+        projectRoot: this.projectRoot,
+        deduplicated: false,
+      })
+    } finally {
+      activeM2ExternalSubmissions.delete(activeKey)
+    }
   }
 
   /** Claim the fixed Host inbox plan and submit it through the normal M2 checks. */
@@ -1526,7 +1632,7 @@ function assertControllerOwnerStopped(owner, runId, { unknownCode, activeCode, o
   throw new DevLoopError(activeCode, activeMessage)
 }
 
-function normalizeExternalPlan(value) {
+export function normalizeExternalPlan(value) {
   const plan = assertPlainObject(value, 'external plan')
   rejectUnknownKeys(plan, ['schema', 'summary', 'scope', 'executionRequirements', 'contextSources', 'observedContext', 'executorTask', 'acceptanceCriteria'], 'external plan')
   if (plan.schema !== 1) throw new Error('external plan schema must be 1')
@@ -1554,6 +1660,109 @@ function normalizeExternalPlan(value) {
   if (!/^[a-f0-9]{40,64}$/i.test(normalized.observedContext.commit)) throw new Error('external plan observedContext.commit must be a Git commit SHA')
   if (plan.acceptanceCriteria !== undefined) normalized.acceptanceCriteria = requiredStringArray(plan.acceptanceCriteria, 'external plan acceptanceCriteria')
   return normalized
+}
+
+/** Normalize the stable retry key used by external Web submissions. */
+export function normalizeExternalRequestId(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value)) {
+    throw new Error('external requestId must be 1–128 safe ASCII characters')
+  }
+  return value
+}
+
+/** Validate source metadata without treating it as identity or authorization. */
+export function normalizeExternalSourceMetadata(value) {
+  const source = assertPlainObject(value, 'external request source')
+  rejectUnknownKeys(source, ['type', 'conversationUrl'], 'external request source')
+  if (source.type !== 'chatgpt-web') throw new Error('external request source.type must be "chatgpt-web"')
+  const normalized = { type: 'chatgpt-web' }
+  if (source.conversationUrl !== undefined) {
+    if (typeof source.conversationUrl !== 'string' || source.conversationUrl.trim() === '') {
+      throw new Error('external request source.conversationUrl must be a non-empty URL')
+    }
+    let url
+    try { url = new URL(source.conversationUrl) } catch (error) {
+      throw new Error('external request source.conversationUrl must be a valid HTTPS ChatGPT URL', { cause: error })
+    }
+    if (url.protocol !== 'https:' || !['chatgpt.com', 'chat.openai.com'].includes(url.hostname)
+      || url.username !== '' || url.password !== '') {
+      throw new Error('external request source.conversationUrl must use https://chatgpt.com or https://chat.openai.com')
+    }
+    normalized.conversationUrl = source.conversationUrl
+  }
+  return normalized
+}
+
+async function readExternalSubmissionReceipt(store, { runId, requestId, requestFingerprint, sessionId, projectRoot, deduplicated }) {
+  try {
+    const reservation = await store.readJson({ runId, name: 'external-request.json' })
+    if (reservation.requestId !== requestId || reservation.requestFingerprint !== requestFingerprint
+      || reservation.sessionId !== sessionId || reservation.projectRoot !== projectRoot) {
+      throw new DevLoopError('EXTERNAL_REQUEST_ID_REUSED', `requestId=${requestId} 已用于不同内容或目标；runId=${runId}`)
+    }
+    const manifest = await store.readJson({ runId, name: 'run-manifest.json' })
+    const verifiedReservation = await readVerifiedRunArtifact(store, manifest, runId, 'external-request.json')
+    const request = await readVerifiedRunArtifact(store, manifest, runId, 'run-request.json')
+    const receipt = await readVerifiedRunArtifact(store, manifest, runId, 'm2-submit-receipt.json')
+    const savedPlan = await readVerifiedRunArtifact(store, manifest, runId, 'plan.json')
+    if (request.requestId !== requestId || request.requestFingerprint !== requestFingerprint
+      || request.sessionId !== sessionId || request.projectRoot !== projectRoot
+      || verifiedReservation.requestId !== requestId || verifiedReservation.requestFingerprint !== requestFingerprint
+      || verifiedReservation.sessionId !== sessionId || verifiedReservation.projectRoot !== projectRoot
+      || receipt.runId !== runId || receipt.requestId !== requestId || receipt.sessionId !== sessionId
+      || receipt.projectRoot !== projectRoot || receipt.state !== 'WAITING_FOR_APPROVAL'
+      || !/^[a-f0-9]{64}$/u.test(receipt.planSha256)
+      || savedPlan.requestId !== requestId || savedPlan.requestFingerprint !== requestFingerprint
+      || JSON.stringify(savedPlan.sourceMetadata) !== JSON.stringify(request.sourceMetadata)) {
+      throw new Error('persisted external M2 receipt does not match its request reservation')
+    }
+    if (hashJson({ requestId, sourceMetadata: request.sourceMetadata, plan: savedPlan.plan, sessionId, projectRoot }) !== requestFingerprint) {
+      throw new Error('persisted external M2 request fingerprint does not match its saved Plan')
+    }
+    await store.verifyArtifact({ runId, name: 'plan.json', sha256: receipt.planSha256 })
+    return {
+      receipt: {
+        runId,
+        requestId,
+        sessionId,
+        state: 'WAITING_FOR_APPROVAL',
+        projectRoot,
+        planSha256: receipt.planSha256,
+      },
+      deduplicated,
+    }
+  } catch (error) {
+    if (error?.code === 'EXTERNAL_REQUEST_ID_REUSED') throw error
+    throw new DevLoopError(
+      'EXTERNAL_REQUEST_OUTCOME_UNKNOWN',
+      `无法确认 external requestId=${requestId} 的持久化结果；没有创建第二个 Run。请先核对 runId=${runId} 的持久化记录。`,
+      { cause: error },
+    )
+  }
+}
+
+async function readVerifiedRunArtifact(store, manifest, runId, name) {
+  const descriptor = Array.isArray(manifest?.artifacts)
+    ? manifest.artifacts.find(artifact => artifact?.name === name)
+    : undefined
+  if (!descriptor || typeof descriptor.sha256 !== 'string') {
+    throw new Error(`persisted run manifest has no verified ${name}`)
+  }
+  await store.verifyArtifact({ runId, name, sha256: descriptor.sha256 })
+  return store.readJson({ runId, name })
+}
+
+function normalizeSha256(value, label) {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/iu.test(value)) throw new Error(`${label} must be a SHA-256 hex digest`)
+  return value.toLowerCase()
+}
+
+function hashText(value) {
+  return sha256Text(value)
+}
+
+function hashJson(value) {
+  return sha256Text(JSON.stringify(value))
 }
 
 function normalizeStagedExternalReview(value) {
@@ -1667,9 +1876,10 @@ async function loadManualHandoffData(store, runId) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted handoff records do not match runId or mode')
   }
   assertDshSessionId(request.sessionId)
-  if (request.planSha256 !== planDescriptor.sha256 || planRecord.source !== 'manual-chatgpt-web-plan-relay') {
+  if (request.planSha256 !== planDescriptor.sha256) {
     throw new DevLoopError('PLAN_RECORD_MISMATCH', 'persisted plan source or digest does not match its run request')
   }
+  await assertManualHandoffSourceConsistency(store, { runId, manifest, request, requestDescriptor, planRecord, planDescriptor })
   if (request.baselineSha256 !== baselineDescriptor.sha256) {
     throw new DevLoopError('BASELINE_HASH_MISMATCH', 'persisted baseline digest does not match its run request')
   }
@@ -1689,6 +1899,55 @@ async function loadManualHandoffData(store, runId) {
   }
 }
 
+async function assertManualHandoffSourceConsistency(store, { runId, manifest, request, requestDescriptor, planRecord, planDescriptor } = {}) {
+  const source = manifest.handoff?.source
+  if (!MANUAL_HANDOFF_SOURCES.has(source)
+    || request.source !== source
+    || planRecord.source !== source
+    || request.planSha256 !== planDescriptor.sha256
+    || manifest.handoff.planSha256 !== planDescriptor.sha256
+    || manifest.handoff.requestSha256 !== requestDescriptor.sha256) {
+    throw new DevLoopError('PLAN_RECORD_MISMATCH', 'persisted plan source or digest does not match its run request')
+  }
+  if (source !== CHATGPT_WEB_CLI_SOURCE) return
+
+  let requestId
+  let sourceMetadata
+  try {
+    requestId = normalizeExternalRequestId(request.requestId)
+    sourceMetadata = normalizeExternalSourceMetadata(request.sourceMetadata)
+  } catch (error) {
+    throw new DevLoopError('PLAN_RECORD_MISMATCH', 'persisted CLI request metadata is invalid', { cause: error })
+  }
+  const requestFingerprint = request.requestFingerprint
+  const requestFileSha256 = request.requestFileSha256
+  if (!/^[a-f0-9]{64}$/u.test(requestFingerprint ?? '')
+    || !/^[a-f0-9]{64}$/u.test(requestFileSha256 ?? '')
+    || requestId !== request.requestId
+    || manifest.handoff.requestId !== requestId
+    || requestId !== planRecord.requestId
+    || requestFingerprint !== planRecord.requestFingerprint
+    || requestFileSha256 !== planRecord.requestFileSha256
+    || JSON.stringify(sourceMetadata) !== JSON.stringify(request.sourceMetadata)
+    || JSON.stringify(request.sourceMetadata) !== JSON.stringify(planRecord.sourceMetadata)
+    || hashJson({ requestId, sourceMetadata, plan: planRecord.plan, sessionId: request.sessionId, projectRoot: request.projectRoot }) !== requestFingerprint) {
+    throw new DevLoopError('PLAN_RECORD_MISMATCH', 'persisted CLI request identity does not match its Plan')
+  }
+
+  const [reservation, receipt] = await Promise.all([
+    readVerifiedRunArtifact(store, manifest, runId, 'external-request.json'),
+    readVerifiedRunArtifact(store, manifest, runId, 'm2-submit-receipt.json'),
+  ])
+  if (reservation.schema !== 1 || reservation.runId !== runId
+    || reservation.requestId !== requestId || reservation.requestFingerprint !== requestFingerprint
+    || reservation.sessionId !== request.sessionId || reservation.projectRoot !== request.projectRoot
+    || receipt.runId !== runId || receipt.requestId !== requestId || receipt.sessionId !== request.sessionId
+    || receipt.projectRoot !== request.projectRoot || receipt.state !== 'WAITING_FOR_APPROVAL'
+    || receipt.planSha256 !== planDescriptor.sha256) {
+    throw new DevLoopError('PLAN_RECORD_MISMATCH', 'persisted CLI request evidence does not match its Run')
+  }
+}
+
 async function assertSettledTerminalManualHandoff(store, { runId, state, manifest } = {}) {
   if (state.runId !== runId || manifest.runId !== runId) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal state and manifest do not match runId')
@@ -1702,9 +1961,19 @@ async function assertSettledTerminalManualHandoff(store, { runId, state, manifes
   if (
     manifest.schema !== 1
     || manifest.handoff?.mode !== 'manual-handoff'
+    || !MANUAL_HANDOFF_SOURCES.has(manifest.handoff?.source)
     || !Array.isArray(manifest.artifacts)
   ) {
     throw new DevLoopError('RUN_RECORD_MISMATCH', 'persisted terminal handoff manifest is incomplete')
+  }
+  if (manifest.artifacts.some(artifact => ['run-request.json', 'plan.json'].includes(artifact.name))) {
+    const requestDescriptor = findArtifact(manifest, 'run-request.json')
+    const planDescriptor = findArtifact(manifest, 'plan.json')
+    const [request, planRecord] = await Promise.all([
+      store.verifyJson({ runId, name: requestDescriptor.name, sha256: requestDescriptor.sha256 }),
+      store.verifyJson({ runId, name: planDescriptor.name, sha256: planDescriptor.sha256 }),
+    ])
+    await assertManualHandoffSourceConsistency(store, { runId, manifest, request, requestDescriptor, planRecord, planDescriptor })
   }
   let machine
   try {
@@ -1842,18 +2111,21 @@ async function hasCompleteExecutionFinalization(store, runId, manifest, ownerArt
     const state = await store.readJson({ runId, name: 'run-state.json' })
     const summaryArtifact = findArtifact(manifest, 'run-summary.json')
     const planArtifact = findArtifact(manifest, 'plan.json')
+    const requestDescriptor = findArtifact(manifest, 'run-request.json')
     const evidenceArtifact = findArtifact(manifest, 'evidence-manifest.json')
     if (findArtifact(manifest, 'execution-owner.json').sha256 !== ownerArtifact.sha256
       || evidenceArtifact.sha256 !== manifest.handoff.evidenceSha256) return false
-    const [summary, planRecord, evidence, audit] = await Promise.all([
+    const [summary, request, planRecord, evidence, audit] = await Promise.all([
       store.verifyJson({ runId, name: summaryArtifact.name, sha256: summaryArtifact.sha256 }),
+      store.verifyJson({ runId, name: requestDescriptor.name, sha256: requestDescriptor.sha256 }),
       store.verifyJson({ runId, name: planArtifact.name, sha256: planArtifact.sha256 }),
       store.verifyJson({ runId, name: evidenceArtifact.name, sha256: evidenceArtifact.sha256 }),
       store.readJson({ runId, name: 'audit-trace.json' }),
     ])
+    await assertManualHandoffSourceConsistency(store, { runId, manifest, request, requestDescriptor, planRecord, planDescriptor: planArtifact })
     if (state.state !== 'REVIEWING' || summary.runId !== runId || summary.state !== 'REVIEWING'
       || !sameRunStateSnapshot(state, audit)
-      || planRecord.runId !== runId || planRecord.source !== 'manual-chatgpt-web-plan-relay'
+      || planRecord.runId !== runId
       || evidence.runId !== runId || evidence.planSha256 !== planSha256
       || summary.handoff?.planSha256 !== planSha256
       || summary.handoff?.evidenceSha256 !== evidenceArtifact.sha256

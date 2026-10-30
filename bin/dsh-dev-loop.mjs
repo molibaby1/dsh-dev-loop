@@ -6,6 +6,7 @@ import { ArtifactStore, createProjectZip, exposeArtifact } from '../src/artifact
 import { BridgeClient } from '../src/bridge-client.mjs'
 import { DevLoopController } from '../src/controller.mjs'
 import { createEvidenceCollector, createGitEvidenceAdapter } from '../src/evidence.mjs'
+import { submitM2RequestToWeb } from '../src/dsh-web-api.mjs'
 
 const [command, ...args] = process.argv.slice(2)
 
@@ -13,8 +14,22 @@ if (command === 'package') {
   await packageCommand(args)
 } else if (command === 'run') {
   await runCommand(args)
+} else if (command === 'm2') {
+  await m2Command(args)
 } else {
-  fail('usage: dsh-dev-loop package|run ...')
+  fail('usage: dsh-dev-loop package|run|m2 submit ...')
+}
+
+async function m2Command(values) {
+  if (values[0] !== 'submit') fail('usage: dsh-dev-loop m2 submit --profile web --project-root <absolute-path> --session-id <id> --request-file <absolute-path> --token-file <absolute-path> [--port <port>]')
+  try {
+    const options = parseM2SubmitOptions(values.slice(1))
+    const receipt = await submitM2RequestToWeb(options)
+    process.stdout.write(`${JSON.stringify(receipt)}\n`)
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 2
+  }
 }
 
 async function packageCommand(values) {
@@ -102,6 +117,34 @@ function parseTestCommand(value) {
 function option(values, name) {
   const index = values.indexOf(name)
   return index >= 0 ? values[index + 1] : undefined
+}
+
+function parseM2SubmitOptions(values) {
+  const allowed = new Set(['--profile', '--project-root', '--session-id', '--request-file', '--token-file', '--host', '--port'])
+  const parsed = new Map()
+  for (let index = 0; index < values.length; index += 2) {
+    const name = values[index]
+    const value = values[index + 1]
+    if (!allowed.has(name)) throw new Error(`unsupported M2 submit option: ${String(name)}`)
+    if (parsed.has(name)) throw new Error(`M2 submit option may appear once: ${name}`)
+    if (typeof value !== 'string' || value === '' || value.startsWith('--')) throw new Error(`${name} requires one value`)
+    parsed.set(name, value)
+  }
+  for (const required of ['--profile', '--project-root', '--session-id', '--request-file', '--token-file']) {
+    if (!parsed.has(required)) throw new Error(`m2 submit requires ${required}`)
+  }
+  const portValue = parsed.get('--port')
+  const port = portValue === undefined ? 3080 : Number(portValue)
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error('--port must be between 1 and 65535')
+  return {
+    profile: parsed.get('--profile'),
+    projectRoot: parsed.get('--project-root'),
+    sessionId: parsed.get('--session-id'),
+    requestFile: parsed.get('--request-file'),
+    tokenFile: parsed.get('--token-file'),
+    host: parsed.get('--host') ?? '127.0.0.1',
+    port,
+  }
 }
 
 function fail(message) {

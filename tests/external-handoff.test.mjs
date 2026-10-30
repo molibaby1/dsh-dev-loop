@@ -5,14 +5,15 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, write
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { ArtifactStore } from '../src/artifacts.mjs'
+import { ArtifactStore, finalizeArtifact } from '../src/artifacts.mjs'
 import { DevLoopController } from '../src/controller.mjs'
 import { createEvidenceCollector, createGitEvidenceAdapter } from '../src/evidence.mjs'
 import { createDshDevLoopController } from '../src/host.mjs'
 import { createPreflightChecker } from '../src/preflight.mjs'
 import { apply } from '../src/plugin.mjs'
 import { apply as applyLivePlugin } from '../src/live-plugin.mjs'
-import { parseDevLoopM2Input } from '../src/command.mjs'
+import { executeDevLoopM2Command, parseDevLoopM2Input } from '../src/command.mjs'
+import { encodeM2ExternalSubmitInput } from '../src/m2-request.mjs'
 import { claimStagedM2Review } from '../src/plan-inbox.mjs'
 
 const fixedPlannerText = `目标：绑定当前仓库的提交失败反馈
@@ -73,6 +74,104 @@ test('M2 handoff text cannot inline approval or override trusted Host settings',
   assert.throws(() => parseDevLoopM2Input(fixedPlannerText.replace('上下文来源：', 'projectRoot：/tmp/other\n上下文来源：')), /不支持的标题/)
 })
 
+test('M2 external request command accepts only an encoded absolute file and project confirmation', () => {
+  const requestFile = '/tmp/chatgpt-request.json'
+  const projectRoot = '/tmp/project'
+  const requestFileSha256 = 'f'.repeat(64)
+  const encoded = Buffer.from(JSON.stringify({ requestFile, projectRoot, requestFileSha256 })).toString('base64url')
+
+  assert.deepEqual(parseDevLoopM2Input(`提交外部方案文件 ${encoded}`), {
+    action: 'submit-external-file',
+    requestFile,
+    projectRoot,
+    requestFileSha256,
+  })
+  const relativePath = Buffer.from(JSON.stringify({
+    requestFile: 'relative.json', projectRoot, requestFileSha256,
+  })).toString('base64url')
+  assert.throws(() => parseDevLoopM2Input(`提交外部方案文件 ${relativePath}`), /absolute/u)
+})
+
+test('M2 external request refuses a real DSH Session whose Host header cwd is another project', async t => {
+  const fixture = await createFixture(t)
+  const requestFile = join(fixture.root, 'request.json')
+  const request = {
+    schema: 1,
+    requestId: 'wrong-session-project',
+    source: { type: 'chatgpt-web' },
+    plan: fixture.plan,
+  }
+  const bytes = Buffer.from(JSON.stringify(request))
+  await writeFile(requestFile, bytes)
+  const input = encodeM2ExternalSubmitInput({
+    requestFile,
+    requestFileSha256: createHash('sha256').update(bytes).digest('hex'),
+    projectRoot: fixture.projectRoot,
+  })
+
+  const result = await executeDevLoopM2Command({
+    ctx: {},
+    config: { projectRoot: fixture.projectRoot, artifactRoot: fixture.artifactRoot },
+    invocation: {
+      rawInput: `提交外部方案文件 ${input}`,
+      agent: { session: { id: 'selected-session', header: { cwd: join(fixture.root, 'other-project') } } },
+      signal: new AbortController().signal,
+    },
+  })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /projectRoot must match configured projectRoot/u)
+  assert.equal((await fixture.store.listRunIds()).length, 0)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+})
+
+test('M2 CLI submission uses the actual invoking Session and real Controller without starting an Agent', async t => {
+  const fixture = await createFixture(t)
+  const requestFile = join(fixture.root, 'valid-request.json')
+  const request = {
+    schema: 1,
+    requestId: 'chatgpt-real-controller-request',
+    source: { type: 'chatgpt-web', conversationUrl: 'https://chatgpt.com/c/example' },
+    plan: fixture.plan,
+  }
+  const bytes = Buffer.from(JSON.stringify(request))
+  await writeFile(requestFile, bytes)
+  const input = encodeM2ExternalSubmitInput({
+    requestFile,
+    requestFileSha256: createHash('sha256').update(bytes).digest('hex'),
+    projectRoot: fixture.projectRoot,
+  })
+
+  const result = await executeDevLoopM2Command({
+    ctx: {
+      agents: {},
+      agentPresets: { mount: async () => {} },
+      permissionPresets: { set() {} },
+    },
+    config: { projectRoot: fixture.projectRoot, artifactRoot: fixture.artifactRoot },
+    invocation: {
+      rawInput: `提交外部方案文件 ${input}`,
+      agent: { session: { id: 'real-session-from-host', header: { cwd: fixture.projectRoot } } },
+      signal: new AbortController().signal,
+    },
+  })
+
+  assert.equal(result.kind, 'success', result.text)
+  const receipt = JSON.parse(result.text)
+  assert.equal(receipt.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(receipt.sessionId, 'real-session-from-host')
+  assert.equal(receipt.projectRoot, await realpath(fixture.projectRoot))
+  const storedRequest = await fixture.store.readJson({ runId: receipt.runId, name: 'run-request.json' })
+  assert.equal(storedRequest.requestId, request.requestId)
+  assert.equal(storedRequest.sessionId, 'real-session-from-host')
+  assert.equal((await fixture.store.readJson({ runId: receipt.runId, name: 'run-state.json' })).state, 'WAITING_FOR_APPROVAL')
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+  assert.equal(fixture.calls.zip, 0)
+  assert.equal(fixture.calls.bridge, 0)
+})
+
 test('M2 plan rejects repository paths that escape the trusted project root', async t => {
   const fixture = await createFixture(t)
   const controller = await fixture.createController()
@@ -116,6 +215,352 @@ test('external plan relay persists for separate approval without ZIP, Bridge, or
   assert.ok(!files.some(file => file.endsWith('.zip')))
   const planRecord = await fixture.store.verifyJson({ runId: result.runId, name: 'plan.json', sha256: result.handoff.planSha256 })
   assert.equal(planRecord.source, 'manual-chatgpt-web-plan-relay')
+})
+
+test('ChatGPT request retries return one persisted M2 receipt bound to its real session', async t => {
+  const fixture = await createFixture(t)
+  const request = {
+    requestId: 'chatgpt-request-1',
+    source: { type: 'chatgpt-web', conversationUrl: 'https://chatgpt.com/c/example' },
+    requestFileSha256: 'a'.repeat(64),
+    plan: fixture.plan,
+  }
+  const first = await (await fixture.createController({ sessionId: 'existing-web-session' }))
+    .submitExternalPlanOnce(request)
+  const retry = await (await fixture.createController({ sessionId: 'existing-web-session' }))
+    .submitExternalPlanOnce(request)
+
+  assert.equal(first.receipt.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(first.receipt.sessionId, 'existing-web-session')
+  assert.equal(first.receipt.projectRoot, await realpath(fixture.projectRoot))
+  assert.match(first.receipt.planSha256, /^[a-f0-9]{64}$/u)
+  assert.equal(retry.deduplicated, true)
+  assert.deepEqual(retry.receipt, first.receipt)
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+
+  const runRequest = await fixture.store.readJson({ runId: first.receipt.runId, name: 'run-request.json' })
+  assert.equal(runRequest.requestId, request.requestId)
+  assert.deepEqual(runRequest.sourceMetadata, request.source)
+  assert.equal(runRequest.requestFileSha256, request.requestFileSha256)
+  assert.equal((await fixture.store.readJson({ runId: first.receipt.runId, name: 'approval.json' })).approved, false)
+  const savedPlan = await fixture.store.verifyJson({
+    runId: first.receipt.runId,
+    name: 'plan.json',
+    sha256: first.receipt.planSha256,
+  })
+  assert.equal(savedPlan.plan.executorTask, fixture.plan.executorTask)
+  assert.deepEqual(savedPlan.sourceMetadata, request.source)
+})
+
+test('a CLI WAITING_FOR_APPROVAL Run can be queried and cancelled by a new Controller without project changes', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController({ sessionId: 'cli-cancel-session' })).submitExternalPlanOnce({
+    requestId: 'chatgpt-cli-cancel',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: 'f'.repeat(64),
+    plan: fixture.plan,
+  })
+  const beforeStatus = runGit(fixture.projectRoot, ['status', '--porcelain'])
+
+  const candidate = await (await fixture.createController({ sessionId: 'cli-cancel-session' }))
+    .findExternalRunForSession({ operation: 'cancel' })
+  assert.equal(candidate.runId, submitted.receipt.runId)
+  assert.equal(candidate.state, 'WAITING_FOR_APPROVAL')
+  const queried = await (await fixture.createController({ sessionId: 'cli-cancel-session' }))
+    .getExternalRunStatus({ runId: submitted.receipt.runId })
+  assert.equal(queried.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(queried.handoff.source, 'chatgpt-web-cli-request')
+
+  const cancelled = await (await fixture.createController({ sessionId: 'cli-cancel-session' }))
+    .cancelRun({ runId: submitted.receipt.runId })
+
+  assert.equal(cancelled.state, 'CANCELLED')
+  assert.equal(cancelled.summary.hasModifiedProject, false)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+  assert.equal(runGit(fixture.projectRoot, ['status', '--porcelain']), beforeStatus)
+  await assert.rejects(readFile(join(fixture.projectRoot, 'result.txt'), 'utf8'), { code: 'ENOENT' })
+
+  const state = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'run-state.json' })
+  const manifest = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'run-manifest.json' })
+  const summary = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'run-summary.json' })
+  const audit = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'audit-trace.json' })
+  const diagnostic = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'diagnostic.json' })
+  assert.equal(state.state, 'CANCELLED')
+  assert.equal(manifest.state, state.state)
+  assert.equal(manifest.handoff.source, 'chatgpt-web-cli-request')
+  assert.equal(summary.state, state.state)
+  assert.equal(summary.handoff.source, manifest.handoff.source)
+  assert.deepEqual(summary.diagnostic, diagnostic)
+  assert.deepEqual(manifest.phases.diagnostic, diagnostic)
+  assert.equal(audit.state, state.state)
+  assert.deepEqual(audit.audit, state.audit)
+  assert.deepEqual(audit.diagnostic, diagnostic)
+  for (const artifact of manifest.artifacts) {
+    await fixture.store.verifyArtifact({ runId: submitted.receipt.runId, name: artifact.name, sha256: artifact.sha256 })
+  }
+
+  const terminalStatus = await (await fixture.createController({ sessionId: 'cli-cancel-session' }))
+    .getExternalRunStatus({ runId: submitted.receipt.runId })
+  assert.equal(terminalStatus.state, 'CANCELLED')
+  await assert.rejects(
+    () => fixture.createController({ sessionId: 'cli-cancel-session' })
+      .then(controller => controller.findExternalRunForSession({ operation: 'status' })),
+    { code: 'RUN_SESSION_CANDIDATE_MISSING' },
+  )
+})
+
+test('a CLI Run can be independently approved and recover execution finalization through the simulated Agent', async t => {
+  const fixture = await createFixture(t, { executionOwnerPid: exitedProcessPid() })
+  const submitted = await (await fixture.createController({ sessionId: 'cli-approval-session' })).submitExternalPlanOnce({
+    requestId: 'chatgpt-cli-approve',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: 'e'.repeat(64),
+    plan: fixture.plan,
+  })
+
+  const approved = await (await fixture.createController({ sessionId: 'cli-approval-session' })).approveExternalPlan({
+    runId: submitted.receipt.runId,
+    planSha256: submitted.receipt.planSha256,
+  })
+
+  assert.equal(approved.state, 'REVIEWING')
+  assert.equal(approved.handoff.source, 'chatgpt-web-cli-request')
+  assert.equal(fixture.calls.executor, 1)
+  assert.equal(fixture.calls.test, 1)
+  const settledPath = join(fixture.artifactRoot, submitted.receipt.runId, 'execution-owner-settled.json')
+  await rm(settledPath)
+
+  const completed = await (await fixture.createController({ sessionId: 'cli-approval-session' })).submitExternalReview({
+    runId: submitted.receipt.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'ACCEPTED',
+    summary: 'The simulated Agent evidence matches the approved plan.',
+    findings: [],
+  })
+
+  assert.equal(completed.state, 'COMPLETE')
+  assert.equal(completed.handoff.source, 'chatgpt-web-cli-request')
+  assert.equal(fixture.calls.executor, 1)
+  const settled = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'execution-owner-settled.json' })
+  assert.equal(settled.runId, submitted.receipt.runId)
+  assert.equal(settled.planSha256, submitted.receipt.planSha256)
+  const status = await (await fixture.createController({ sessionId: 'cli-approval-session' }))
+    .getExternalRunStatus({ runId: submitted.receipt.runId })
+  assert.equal(status.state, 'COMPLETE')
+  await assert.rejects(
+    () => fixture.createController({ sessionId: 'cli-approval-session' })
+      .then(controller => controller.findExternalRunForSession({ operation: 'status' })),
+    { code: 'RUN_SESSION_CANDIDATE_MISSING' },
+  )
+})
+
+test('CLI source validation rejects unsupported or inconsistent persisted request evidence', async t => {
+  await t.test('rejects an unsupported source even when Plan, Run Request, and Manifest agree', async t => {
+    const fixture = await createFixture(t)
+    const submitted = await (await fixture.createController()).submitExternalPlanOnce({
+      requestId: 'chatgpt-cli-unsupported-source',
+      source: { type: 'chatgpt-web' },
+      requestFileSha256: 'd'.repeat(64),
+      plan: fixture.plan,
+    })
+    const runId = submitted.receipt.runId
+    await rewritePersistedRunJson(fixture, runId, 'run-request.json', request => ({
+      ...request,
+      source: 'unrecognized-m2-source',
+    }))
+    await rewritePersistedRunJson(fixture, runId, 'plan.json', plan => ({
+      ...plan,
+      source: 'unrecognized-m2-source',
+    }))
+    const manifest = await fixture.store.readJson({ runId, name: 'run-manifest.json' })
+    manifest.handoff.source = 'unrecognized-m2-source'
+    await fixture.store.writeJson({ runId, stage: 'test-tamper', name: 'run-manifest.json', value: manifest, source: 'test' })
+
+    await assert.rejects(
+      () => fixture.createController().then(controller => controller.getExternalRunStatus({ runId })),
+      { code: 'PLAN_RECORD_MISMATCH' },
+    )
+  })
+
+  await t.test('rejects a mixed legacy and CLI source', async t => {
+    const fixture = await createFixture(t)
+    const submitted = await (await fixture.createController()).submitExternalPlanOnce({
+      requestId: 'chatgpt-cli-mixed-source',
+      source: { type: 'chatgpt-web' },
+      requestFileSha256: 'c'.repeat(64),
+      plan: fixture.plan,
+    })
+    const runId = submitted.receipt.runId
+    await rewritePersistedRunJson(fixture, runId, 'run-request.json', request => ({
+      ...request,
+      source: 'manual-chatgpt-web-plan-relay',
+    }))
+
+    await assert.rejects(
+      () => fixture.createController().then(controller => controller.getExternalRunStatus({ runId })),
+      { code: 'PLAN_RECORD_MISMATCH' },
+    )
+  })
+
+  await t.test('rejects a changed CLI request fingerprint', async t => {
+    const fixture = await createFixture(t)
+    const submitted = await (await fixture.createController()).submitExternalPlanOnce({
+      requestId: 'chatgpt-cli-changed-fingerprint',
+      source: { type: 'chatgpt-web' },
+      requestFileSha256: 'b'.repeat(64),
+      plan: fixture.plan,
+    })
+    const runId = submitted.receipt.runId
+    await rewritePersistedRunJson(fixture, runId, 'run-request.json', request => ({
+      ...request,
+      requestFingerprint: '0'.repeat(64),
+    }))
+
+    await assert.rejects(
+      () => fixture.createController().then(controller => controller.getExternalRunStatus({ runId })),
+      { code: 'PLAN_RECORD_MISMATCH' },
+    )
+  })
+
+  await t.test('rejects a changed CLI requestId', async t => {
+    const fixture = await createFixture(t)
+    const submitted = await (await fixture.createController()).submitExternalPlanOnce({
+      requestId: 'chatgpt-cli-changed-request-id',
+      source: { type: 'chatgpt-web' },
+      requestFileSha256: 'a'.repeat(64),
+      plan: fixture.plan,
+    })
+    const runId = submitted.receipt.runId
+    await rewritePersistedRunJson(fixture, runId, 'run-request.json', request => ({
+      ...request,
+      requestId: 'different-request-id',
+    }))
+
+    await assert.rejects(
+      () => fixture.createController().then(controller => controller.getExternalRunStatus({ runId })),
+      { code: 'PLAN_RECORD_MISMATCH' },
+    )
+  })
+})
+
+test('CLI follow-up operations remain bound to their DSH Session and configured project', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController({ sessionId: 'cli-owner-session' })).submitExternalPlanOnce({
+    requestId: 'chatgpt-cli-owner-check',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: '9'.repeat(64),
+    plan: fixture.plan,
+  })
+  const otherSession = await fixture.createController({ sessionId: 'different-session' })
+  await assert.rejects(
+    otherSession.getExternalRunStatus({ runId: submitted.receipt.runId }),
+    { code: 'RUN_SESSION_MISMATCH' },
+  )
+
+  const otherProject = await fixture.createController({ sessionId: 'cli-owner-session' })
+  otherProject.projectRoot = join(fixture.root, 'another-project')
+  await assert.rejects(
+    otherProject.getExternalRunStatus({ runId: submitted.receipt.runId }),
+    { code: 'PROJECT_ROOT_CHANGED' },
+  )
+})
+
+test('reusing a ChatGPT request id for different content is rejected without another M2 Run', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const request = {
+    requestId: 'chatgpt-request-2',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: 'b'.repeat(64),
+    plan: fixture.plan,
+  }
+  const first = await controller.submitExternalPlanOnce(request)
+
+  await assert.rejects(
+    () => controller.submitExternalPlanOnce({
+      ...request,
+      plan: { ...fixture.plan, executorTask: 'Different task body.' },
+      requestFileSha256: 'c'.repeat(64),
+    }),
+    /requestId=.*不同内容/u,
+  )
+
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(first.receipt.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+})
+
+test('a ChatGPT Plan with a stale Git commit fails in the Controller before approval or execution', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController({ sessionId: 'stale-plan-session' })
+
+  await assert.rejects(() => controller.submitExternalPlanOnce({
+    requestId: 'chatgpt-stale-git-context',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: 'c'.repeat(64),
+    plan: {
+      ...fixture.plan,
+      observedContext: { branch: fixture.plan.observedContext.branch, commit: '0'.repeat(40) },
+    },
+  }), /state=FAILED/u)
+
+  const runId = (await fixture.store.listRunIds()).find(value => value.startsWith('m2-'))
+  assert.ok(runId)
+  assert.equal((await fixture.store.readJson({ runId, name: 'run-state.json' })).state, 'FAILED')
+  await assert.rejects(fixture.store.readJson({ runId, name: 'approval.json' }), { code: 'ENOENT' })
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+})
+
+test('a new ChatGPT request refuses an incompatible unfinished M2 Run in the same session', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController({ sessionId: 'busy-session' })
+  const current = await controller.submitExternalPlan({ plan: fixture.plan })
+
+  await assert.rejects(
+    () => controller.submitExternalPlanOnce({
+      requestId: 'chatgpt-request-busy',
+      source: { type: 'chatgpt-web' },
+      requestFileSha256: 'd'.repeat(64),
+      plan: fixture.plan,
+    }),
+    /已有未结束的 M2 任务/u,
+  )
+
+  assert.equal(current.state, 'WAITING_FOR_APPROVAL')
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
+})
+
+test('an uncertain initial ChatGPT submission is checked from storage and never creates a second Run', async t => {
+  const fixture = await createFixture(t)
+  const controller = await fixture.createController()
+  const request = {
+    requestId: 'chatgpt-request-uncertain',
+    source: { type: 'chatgpt-web' },
+    requestFileSha256: 'e'.repeat(64),
+    plan: fixture.plan,
+  }
+  const writeJsonOnce = controller.store.writeJsonOnce.bind(controller.store)
+  controller.store.writeJsonOnce = async options => {
+    if (options.name === 'run-state.json') throw new Error('simulated uncertain state write')
+    return writeJsonOnce(options)
+  }
+
+  await assert.rejects(() => controller.submitExternalPlanOnce(request), /simulated uncertain state write/u)
+
+  await assert.rejects(
+    () => fixture.createController().then(next => next.submitExternalPlanOnce(request)),
+    /无法确认.*没有创建第二个 Run/u,
+  )
+  assert.equal((await fixture.store.listRunIds()).length, 1)
+  assert.equal(fixture.calls.executor, 0)
+  assert.equal(fixture.calls.test, 0)
 })
 
 test('a staged plan is claimed once and bound to the trusted DSH session', async t => {
@@ -1612,6 +2057,29 @@ function runGit(cwd, args) {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' })
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`)
   return result.stdout.trim()
+}
+
+async function rewritePersistedRunJson(fixture, runId, name, update) {
+  const manifest = await fixture.store.readJson({ runId, name: 'run-manifest.json' })
+  const value = update(await fixture.store.readJson({ runId, name }))
+  const descriptor = await finalizeArtifact(await fixture.store.writeJson({ runId, stage: 'test-tamper', name, value, source: 'test' }))
+  manifest.artifacts = manifest.artifacts.map(artifact => artifact.name === name ? { ...descriptor } : artifact)
+  if (name === 'run-request.json') manifest.handoff.requestSha256 = descriptor.sha256
+  if (name === 'plan.json') {
+    manifest.handoff.planSha256 = descriptor.sha256
+    const request = await fixture.store.readJson({ runId, name: 'run-request.json' })
+    request.planSha256 = descriptor.sha256
+    const requestDescriptor = await finalizeArtifact(await fixture.store.writeJson({
+      runId,
+      stage: 'test-tamper',
+      name: 'run-request.json',
+      value: request,
+      source: 'test',
+    }))
+    manifest.artifacts = manifest.artifacts.map(artifact => artifact.name === 'run-request.json' ? { ...requestDescriptor } : artifact)
+    manifest.handoff.requestSha256 = requestDescriptor.sha256
+  }
+  await fixture.store.writeJson({ runId, stage: 'test-tamper', name: 'run-manifest.json', value: manifest, source: 'test' })
 }
 
 function exitedProcessPid() {

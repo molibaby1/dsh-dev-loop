@@ -5,6 +5,7 @@ import { diagnosticForInput, diagnosticFromError } from './diagnostics.mjs'
 import { assertConfiguredProjectRoot } from './project-root.mjs'
 import { presentStage, summarizeResult } from './presentation.mjs'
 import { DEV_LOOP_VERSION } from './version.mjs'
+import { decodeM2ExternalSubmitInput, readM2ExternalRequestFile } from './m2-request.mjs'
 
 /** Parse friendly Chinese text or the legacy JSON `/dev-loop` input. */
 export function parseDevLoopInput(rawInput, defaults = {}) {
@@ -192,6 +193,11 @@ export function parseDevLoopM2Input(rawInput) {
     ['取消当前任务', { action: 'cancel-current-task' }],
   ])
   if (actions.has(text)) return actions.get(text)
+  const externalSubmitPrefix = '提交外部方案文件 '
+  if (text.startsWith(externalSubmitPrefix)) {
+    return { action: 'submit-external-file', ...decodeM2ExternalSubmitInput(text.slice(externalSubmitPrefix.length)) }
+  }
+  if (text === '提交外部方案文件') throw new Error('提交外部方案文件需要 CLI 提供的文件路径、哈希和项目确认')
   if (text.startsWith('{')) throw new Error('M2 入口只接受固定标题普通文本；不要提交 JSON')
   if (text === '提交复审结果') throw new Error('请在“提交复审结果”后粘贴 Reviewer 回执、decision、摘要和发现的问题')
   if (text.startsWith('提交复审结果\n') || text.startsWith('提交复审结果\r\n')) {
@@ -211,6 +217,16 @@ export async function executeDevLoopM2Command({ ctx, config = {}, invocation } =
     const sessionId = invocation?.agent?.session?.id
     if (typeof sessionId !== 'string' || sessionId.trim() === '') {
       throw new Error('无法从可信 DSH 调用上下文读取 session ID；任务尚未提交或执行')
+    }
+    let externalRequest
+    if (action.action === 'submit-external-file') {
+      const configuredProjectRoot = assertConfiguredProjectRoot(config.projectRoot, action.projectRoot)
+      const sessionCwd = invocation?.agent?.session?.header?.cwd
+      if (typeof sessionCwd !== 'string' || !isAbsolute(sessionCwd)) {
+        throw new Error('无法从可信 DSH Session header 验证项目归属；任务尚未提交或执行')
+      }
+      assertConfiguredProjectRoot(configuredProjectRoot, sessionCwd)
+      externalRequest = await readM2ExternalRequestFile(action.requestFile, action.requestFileSha256)
     }
     const controller = await createDshDevLoopController({
       ctx,
@@ -234,7 +250,21 @@ export async function executeDevLoopM2Command({ ctx, config = {}, invocation } =
       })
     }
     try {
-      if (action.action === 'submit-plan') {
+      if (action.action === 'submit-external-file') {
+        promise = controller.submitExternalPlanOnce({
+          plan: externalRequest.request.plan,
+          requestId: externalRequest.request.requestId,
+          source: externalRequest.request.source,
+          requestFileSha256: externalRequest.sha256,
+          signal: linked.signal,
+          onEvent,
+        })
+        const submitted = await promise
+        return {
+          kind: 'success',
+          text: JSON.stringify({ ...submitted.receipt, deduplicated: submitted.deduplicated }),
+        }
+      } else if (action.action === 'submit-plan') {
         promise = controller.submitExternalPlan({ plan: action.plan, signal: linked.signal, onEvent })
       } else if (action.action === 'claim-pending-plan') {
         promise = controller.submitPendingExternalPlan({ signal: linked.signal, onEvent })
