@@ -305,7 +305,7 @@ function safeRelativeFile(file) {
 }
 
 function safeSnapshotName(value) {
-  if (!['baseline', 'approval-check', 'reviewer-current'].includes(value) && !/^after-round-\d+$/u.test(value)) {
+  if (!['baseline', 'approval-check', 'execution-baseline', 'reviewer-current'].includes(value) && !/^after-round-\d+$/u.test(value)) {
     throw new Error(`unsupported snapshot name: ${String(value)}`)
   }
   return value
@@ -402,7 +402,7 @@ export async function diffSnapshots({ baseline, after, gitAdapter, signal }) {
       operation: 'snapshot-diff',
       repoRoot: gitAdapter.projectRoot,
       snapshotRoot: baseline.snapshotRoot,
-      beforeSnapshot: 'baseline',
+      beforeSnapshot: baseline.snapshotName ?? 'baseline',
       afterSnapshot: after.snapshotName ?? snapshotNameFromPath(after.snapshotDir),
       file,
       beforeExists: Boolean(baseline.fileHashes?.[file]),
@@ -424,7 +424,7 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
   if (typeof testExecutor !== 'function') throw new Error('DSH test executor is required')
   return {
     gitAdapter,
-    async collect({ runId, round = 0, repoRoot, executorReport, baseline, signal, onProgress, testCommand: requestedTestCommand }) {
+    async collect({ runId, round = 0, repoRoot, executorReport, baseline, scope, signal, onProgress, testCommand: requestedTestCommand }) {
       throwIfAborted(signal)
       const after = await captureGitSnapshot({
         repoRoot,
@@ -448,10 +448,12 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
         ...(onProgress ? { onProgress } : {}),
       })
       const changedFileNames = changedFilesBetween(baseline, after)
+      const scopeAssessment = scope ? assessExecutionScope(scope, executorReport, changedFileNames, after, repoRoot) : undefined
       const summary = {
         round,
         changedFiles: changedFileNames.length,
         changedFileNames,
+        ...(scopeAssessment ? { scopeAssessment } : {}),
         deltaBytes: Buffer.byteLength(delta ?? '', 'utf8'),
         baseline: { commit: baseline?.commit ?? null, dirty: Boolean(baseline?.dirty) },
         after: {
@@ -517,7 +519,7 @@ export function createEvidenceCollector({ store, gitAdapter, testExecutor, artif
       const baselineArtifact = await store.writeJson({
         runId,
         stage: `evidence-${round}`,
-        name: `baseline-snapshot${suffix}.json`,
+        name: `${baseline?.snapshotName === 'execution-baseline' ? 'execution-baseline' : 'baseline'}-snapshot${suffix}.json`,
         value: compactSnapshot(baseline),
         source: 'git-baseline',
       })
@@ -597,6 +599,56 @@ function changedFilesBetween(baseline, after) {
   const changedWorktreeFiles = [...new Set([...Object.keys(baseline?.fileHashes ?? {}), ...Object.keys(after?.fileHashes ?? {})])]
     .filter(file => baseline?.fileHashes?.[file] !== after?.fileHashes?.[file])
   return [...new Set([...changedWorktreeFiles, ...(after?.committedFiles ?? [])])].sort()
+}
+
+function assessExecutionScope(scope, executorReport, changedFileNames, after, repoRoot) {
+  const executorPaths = new Set()
+  for (const event of executorReport?.events ?? []) {
+    if (event.type !== 'tool/call') continue
+    const args = parseToolArguments(event.data?.arguments)
+    if (!args) continue
+    if (event.data.name === 'write' || event.data.name === 'edit') {
+      addRepositoryPath(executorPaths, repoRoot, args.file_path)
+    } else if (event.data.name === 'str_replace_editor' && ['create', 'str_replace', 'insert'].includes(args.command)) {
+      addRepositoryPath(executorPaths, repoRoot, args.path)
+    } else if (event.data.name === 'bash' && typeof args.command === 'string') {
+      const command = args.command
+      if (/\bgit\s+(?:add|clean|rm|restore|checkout|mv|reset)\b/u.test(command)) {
+        for (const file of changedFileNames) if (command.includes(file)) executorPaths.add(file)
+      }
+      if (/\bgit\s+add\s+(?:--all|-A|\.)(?:\s|$)/u.test(command)) {
+        for (const file of after.committedFiles ?? []) executorPaths.add(file)
+      }
+    }
+  }
+  const outOfScope = file => !scope.includedPaths.some(path => containsRepositoryPath(path, file))
+    || scope.excludedPaths.some(path => containsRepositoryPath(path, file))
+  const outOfScopeChanges = changedFileNames.filter(outOfScope)
+  return {
+    attributedOutOfScopeFileNames: outOfScopeChanges.filter(file => executorPaths.has(file)),
+    unattributedOutOfScopeFileNames: outOfScopeChanges.filter(file => !executorPaths.has(file)),
+  }
+}
+
+function parseToolArguments(value) {
+  if (typeof value !== 'string') return value && typeof value === 'object' && !Array.isArray(value) ? value : undefined
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined
+    throw error
+  }
+}
+
+function addRepositoryPath(paths, repoRoot, value) {
+  if (typeof value !== 'string' || value.trim() === '') return
+  const path = relative(repoRoot, resolve(repoRoot, value))
+  if (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path)) paths.add(path.split(sep).join('/'))
+}
+
+function containsRepositoryPath(scopePath, file) {
+  return scopePath === '.' || file === scopePath || file.startsWith(`${scopePath}/`)
 }
 
 function throwIfAborted(signal) {

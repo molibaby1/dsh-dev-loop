@@ -442,7 +442,6 @@ export class DevLoopController {
         signal,
       })
       const observedProject = contextFromSnapshot(baseline)
-      assertPlanContextMatches(plan.observedContext, observedProject)
       const baselineArtifact = await addJson('analysis', 'baseline-snapshot.json', persistableBaseline(baseline), 'git-baseline')
       const planRecord = await record(await this.store.writeJsonOnce({
         runId,
@@ -478,6 +477,7 @@ export class DevLoopController {
           projectRoot: this.projectRoot,
           artifactRoot,
           sessionId,
+          planObservedContext: plan.observedContext,
           ...(requestId === undefined ? {} : {
             requestId,
             sourceMetadata,
@@ -679,6 +679,9 @@ export class DevLoopController {
       try { onEvent?.(value) } catch {}
     }
     const artifacts = data.artifacts.map(artifact => ({ ...artifact }))
+    let executionBaseline
+    let executionContext
+    let contextChangesSinceSubmission = []
     const record = async descriptor => {
       const finalized = descriptor.sha256 ? descriptor : await finalizeArtifact(descriptor)
       upsertArtifact(artifacts, finalized)
@@ -689,22 +692,6 @@ export class DevLoopController {
     notify({ kind: 'started', projectRoot: this.projectRoot, artifactRoot, stage: 'EXECUTING' })
     throwIfAborted(signal)
     const preflightResult = await this.preflight({ projectRoot: this.projectRoot, artifactRoot, signal })
-    const current = await captureGitSnapshot({
-      repoRoot: this.projectRoot,
-      gitAdapter: this.gitAdapter,
-      artifactRoot,
-      snapshotRoot,
-      snapshotName: 'approval-check',
-      signal,
-    })
-    if (!sameProjectSnapshot(data.request.projectState, data.baselineSnapshot, current)) {
-      return this.stopManualHandoff({
-        data,
-        reason: 'project Git/worktree context changed after plan submission; a new plan approval is required',
-        code: 'PROJECT_CONTEXT_CHANGED',
-        onEvent,
-      })
-    }
     await this.store.writeJsonOnce({
       runId,
       stage: 'approval',
@@ -754,16 +741,35 @@ export class DevLoopController {
           source: 'separate-human-command',
           planSha256,
           contextSha256: data.request.projectState.filesSha256,
+          planObservedContext: plan.observedContext,
+          submittedProjectState: data.request.projectState,
         },
         source: 'separate-human-command',
       }))
       await addJson('preflight', 'preflight-approval.json', preflightResult, 'preflight')
-      await transition('EXECUTING', { planSha256, approvalSha256: approval.sha256 })
+      executionBaseline = await captureGitSnapshot({
+        repoRoot: this.projectRoot,
+        gitAdapter: this.gitAdapter,
+        artifactRoot,
+        snapshotRoot,
+        snapshotName: 'execution-baseline',
+        compareCommit: baseline.commit,
+        signal,
+      })
+      executionContext = contextFromSnapshot(executionBaseline)
+      contextChangesSinceSubmission = changedFilesBetweenSnapshots(baseline, executionBaseline)
+      await addJson('analysis', 'execution-baseline-snapshot.json', persistableBaseline(executionBaseline), 'git-execution-baseline')
+      await transition('EXECUTING', {
+        planSha256,
+        approvalSha256: approval.sha256,
+        executionContextSha256: executionContext.filesSha256,
+        contextChangesSinceSubmission,
+      })
       throwIfAborted(signal)
       const executorReport = await this.executor.execute({
         runId,
         cwd: this.projectRoot,
-        task: externalExecutionTask(plan),
+        task: externalExecutionTask(plan, { ...executionContext, changedFileNamesSinceSubmission: contextChangesSinceSubmission }),
         signal,
         onProgress: activity => notify({ kind: 'activity', activity }),
       })
@@ -774,14 +780,15 @@ export class DevLoopController {
         round: 0,
         repoRoot: this.projectRoot,
         executorReport,
-        baseline,
+        baseline: executionBaseline,
+        scope: plan.scope,
         signal,
         onProgress: activity => notify({ kind: 'activity', activity }),
       })
       evidenceSummary = evidence.summary
       const evidenceArtifacts = []
       for (const artifact of evidence.artifacts) evidenceArtifacts.push(await record(artifact))
-      assertExternalExecutionScope(plan.scope, evidence)
+      assertExternalExecutionScope(evidence)
       const projectState = contextFromSnapshot(evidence.after)
       const evidenceManifest = await record(await this.store.writeJsonOnce({
         runId,
@@ -794,6 +801,8 @@ export class DevLoopController {
           planSha256,
           createdAt: new Date().toISOString(),
           projectState,
+          changedFileNames: evidenceSummary.changedFileNames,
+          scopeAssessment: evidenceSummary.scopeAssessment,
           test: evidenceSummary.test,
           artifacts: evidenceArtifacts.map(exposeArtifact),
         },
@@ -823,6 +832,9 @@ export class DevLoopController {
         evidenceManifestPath: join(artifactRoot, runId, 'evidence-manifest.json'),
         evidenceFiles: evidenceArtifacts.map(artifact => artifact.name),
         projectState,
+        executionBaselineState: executionContext,
+        contextChangesSinceSubmission,
+        scopeAssessment: evidenceSummary.scopeAssessment,
         test: evidenceSummary.test,
       }
       await transition('REVIEWING', { evidenceSha256: evidenceManifest.sha256 })
@@ -974,17 +986,42 @@ export class DevLoopController {
       artifactRoot: this.store.root,
       snapshotRoot: join(runRoot, '.snapshots'),
       snapshotName: 'reviewer-current',
+      compareCommit: afterSnapshot.commit,
     })
-    const evidenceStale = !sameProjectSnapshot(evidence.projectState, afterSnapshot, current)
+    const changedFileNames = changedFilesBetweenSnapshots(afterSnapshot, current)
+    const unattributedOutOfScopeFileNames = evidence.scopeAssessment?.unattributedOutOfScopeFileNames ?? []
+    const changedTaskFileNames = changedFileNames.filter(file =>
+      (evidence.changedFileNames ?? []).includes(file) && !unattributedOutOfScopeFileNames.includes(file))
     await this.#claimExternalReviewResolution({ runId, action: 'review', planSha256, evidenceSha256 })
     const latestState = await this.store.readJson({ runId, name: 'run-state.json' })
     if (!sameRunStateSnapshot(data.state, latestState)) {
       throw new DevLoopError('RUN_STATE_CHANGED', `run state changed from ${data.state.state} to ${latestState.state}; review was not recorded`)
     }
-    if (evidenceStale) {
+    const reviewContextArtifact = await finalizeArtifact(await this.store.writeJsonOnce({
+      runId,
+      stage: 'review-context',
+      name: 'review-context.json',
+      value: {
+        schema: 1,
+        runId,
+        evidenceSha256,
+        currentProjectState: contextFromSnapshot(current),
+        changedFileNames,
+        changedTaskFileNames,
+      },
+      source: 'controller-review-context',
+    }))
+    const artifacts = data.artifacts.map(artifact => ({ ...artifact }))
+    upsertArtifact(artifacts, reviewContextArtifact)
+    const handoff = {
+      ...data.manifest.handoff,
+      reviewContextSha256: reviewContextArtifact.sha256,
+      reviewContextPath: join(this.store.root, runId, 'review-context.json'),
+    }
+    if (changedTaskFileNames.length > 0) {
       return this.stopManualHandoff({
-        data,
-        reason: 'project Git/worktree context changed after evidence collection; the review evidence is stale',
+        data: { ...data, artifacts, manifest: { ...data.manifest, handoff } },
+        reason: `task evidence paths changed after evidence collection: ${changedTaskFileNames.join(', ')}`,
         code: 'EVIDENCE_STALE',
       })
     }
@@ -1000,7 +1037,6 @@ export class DevLoopController {
       source: 'manual-chatgpt-web-review-relay',
       receivedAt: new Date().toISOString(),
     }
-    const artifacts = data.artifacts.map(artifact => ({ ...artifact }))
     const reviewArtifact = await finalizeArtifact(await this.store.writeJsonOnce({
       runId,
       stage: 'review',
@@ -1022,8 +1058,8 @@ export class DevLoopController {
       })
     }
     await this.store.writeJson({ runId, stage: 'state', name: 'run-state.json', value: machine.snapshot(), source: 'controller-state' })
-    const handoff = {
-      ...data.manifest.handoff,
+    const completedHandoff = {
+      ...handoff,
       reviewSource: review.source,
       reviewerDecision: decision,
       reviewSha256: reviewArtifact.sha256,
@@ -1038,7 +1074,7 @@ export class DevLoopController {
       review,
       preflight: data.manifest.phases.preflight,
       evidenceSummary: data.manifest.phases.evidenceSummary,
-      handoff,
+      handoff: completedHandoff,
     })
     return result
   }
@@ -1386,6 +1422,7 @@ export class DevLoopController {
       test: evidenceSummary?.test ?? null,
       changedFiles: evidenceSummary?.changedFiles ?? null,
       changedFileNames: evidenceSummary?.changedFileNames ?? [],
+      scopeAssessment: evidenceSummary?.scopeAssessment ?? null,
       diagnostic: diagnostic ?? null,
     }
     if (handoff) summaryValue.handoff = handoff
@@ -1543,6 +1580,7 @@ function persistableBaseline(snapshot) {
     dirty: Boolean(snapshot?.dirty),
     files: snapshot?.files ?? [],
     fileHashes: snapshot?.fileHashes ?? {},
+    ...(snapshot?.compareCommit ? { compareCommit: snapshot.compareCommit, committedFiles: snapshot.committedFiles ?? [] } : {}),
   }
 }
 
@@ -1552,6 +1590,7 @@ function hydrateBaseline(snapshot, snapshotRoot) {
     ...snapshot,
     diff: '',
     snapshotRoot,
+    snapshotName: 'baseline',
     snapshotDir: join(snapshotRoot, 'baseline'),
   }
 }
@@ -1801,12 +1840,6 @@ function branchFromStatus(status) {
   const branch = value.split('...', 1)[0].split(' ', 1)[0]
   if (!branch) throw new Error('Git status reported an empty branch name')
   return branch
-}
-
-function assertPlanContextMatches(observed, actual) {
-  if (observed.branch !== actual.branch || observed.commit.toLowerCase() !== actual.commit.toLowerCase()) {
-    throw new DevLoopError('PLAN_CONTEXT_MISMATCH', '外部方案观察到的分支或 commit 与当前项目不一致')
-  }
 }
 
 function requiredString(value, label) {
@@ -2083,18 +2116,6 @@ function assertSha256(value, label) {
   if (typeof value !== 'string' || !/^[a-f0-9]{64}$/i.test(value)) throw new Error(`${label} must be a SHA-256 hex digest`)
 }
 
-function sameProjectSnapshot(expectedContext, expectedSnapshot, current) {
-  const actualContext = contextFromSnapshot(current)
-  return expectedContext.branch === actualContext.branch
-    && expectedContext.commit === actualContext.commit
-    && expectedContext.statusSha256 === actualContext.statusSha256
-    && expectedContext.diffSha256 === actualContext.diffSha256
-    && expectedContext.filesSha256 === actualContext.filesSha256
-    && expectedSnapshot.status === current.status
-    && expectedSnapshot.dirty === current.dirty
-    && equalFileHashes(expectedSnapshot.fileHashes, current.fileHashes)
-}
-
 function sameRunStateSnapshot(left, right) {
   return left?.runId === right?.runId
     && left?.state === right?.state
@@ -2149,11 +2170,6 @@ async function hasCompleteExecutionFinalization(store, runId, manifest, ownerArt
   }
 }
 
-function equalFileHashes(left = {}, right = {}) {
-  const sorted = value => JSON.stringify(Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))))
-  return sorted(left) === sorted(right)
-}
-
 function sameReviewerProject(reported, expected) {
   if (!reported || typeof reported !== 'object' || Array.isArray(reported)) return false
   return reported.branch === expected.branch
@@ -2181,9 +2197,12 @@ function assertSuccessfulExecutorTurn(result) {
   }
 }
 
-function externalExecutionTask(plan) {
+function externalExecutionTask(plan, currentProjectState) {
   return [
     'Execute only the approved M2 plan below in the Host-configured project root.',
+    'The planner context may be older than the current project. Inspect and use the current files and Git state; do not restore an earlier commit or overwrite unrelated work.',
+    `Current project context: ${JSON.stringify({ branch: currentProjectState.branch, commit: currentProjectState.commit, dirty: currentProjectState.dirty })}.`,
+    `Files and commits changed since plan submission: ${JSON.stringify(currentProjectState.changedFileNamesSinceSubmission)}. Review their current contents where relevant to the approved task.`,
     `Included repository paths: ${JSON.stringify(plan.scope.includedPaths)}.`,
     `Excluded repository paths: ${JSON.stringify(plan.scope.excludedPaths)}.`,
     `Non-goals: ${JSON.stringify(plan.scope.nonGoals)}.`,
@@ -2193,17 +2212,15 @@ function externalExecutionTask(plan) {
   ].join('\n')
 }
 
-function assertExternalExecutionScope(scope, evidence) {
-  const outOfScope = (evidence.summary?.changedFileNames ?? []).filter(file => {
-    const included = scope.includedPaths.some(path => containsRepositoryPath(path, file))
-    const excluded = scope.excludedPaths.some(path => containsRepositoryPath(path, file))
-    return !included || excluded
-  })
+function assertExternalExecutionScope(evidence) {
+  const outOfScope = evidence.summary?.scopeAssessment?.attributedOutOfScopeFileNames ?? []
   if (outOfScope.length > 0) {
     throw new DevLoopError('EXECUTION_SCOPE_VIOLATION', `DSH Agent changed paths outside the approved scope: ${outOfScope.join(', ')}`)
   }
 }
 
-function containsRepositoryPath(scopePath, file) {
-  return scopePath === '.' || file === scopePath || file.startsWith(`${scopePath}/`)
+function changedFilesBetweenSnapshots(before, after) {
+  const fileChanges = [...new Set([...Object.keys(before?.fileHashes ?? {}), ...Object.keys(after?.fileHashes ?? {})])]
+    .filter(file => before?.fileHashes?.[file] !== after?.fileHashes?.[file])
+  return [...new Set([...fileChanges, ...(after?.committedFiles ?? [])])].sort()
 }

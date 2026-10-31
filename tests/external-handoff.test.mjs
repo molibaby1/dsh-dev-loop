@@ -494,24 +494,30 @@ test('reusing a ChatGPT request id for different content is rejected without ano
   assert.equal(fixture.calls.test, 0)
 })
 
-test('a ChatGPT Plan with a stale Git commit fails in the Controller before approval or execution', async t => {
+test('a ChatGPT Plan with an older Git observation is submitted against the current project', async t => {
   const fixture = await createFixture(t)
   const controller = await fixture.createController({ sessionId: 'stale-plan-session' })
 
-  await assert.rejects(() => controller.submitExternalPlanOnce({
+  await writeFile(join(fixture.projectRoot, 'parallel.txt'), 'committed after planning\n')
+  runGit(fixture.projectRoot, ['add', 'parallel.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'parallel task'])
+  runGit(fixture.projectRoot, ['checkout', '-b', 'parallel-task'])
+  await writeFile(join(fixture.projectRoot, 'planning-work.txt'), 'uncommitted parallel task\n')
+
+  const submitted = await controller.submitExternalPlanOnce({
     requestId: 'chatgpt-stale-git-context',
     source: { type: 'chatgpt-web' },
     requestFileSha256: 'c'.repeat(64),
-    plan: {
-      ...fixture.plan,
-      observedContext: { branch: fixture.plan.observedContext.branch, commit: '0'.repeat(40) },
-    },
-  }), /state=FAILED/u)
+    plan: fixture.plan,
+  })
 
-  const runId = (await fixture.store.listRunIds()).find(value => value.startsWith('m2-'))
-  assert.ok(runId)
-  assert.equal((await fixture.store.readJson({ runId, name: 'run-state.json' })).state, 'FAILED')
-  await assert.rejects(fixture.store.readJson({ runId, name: 'approval.json' }), { code: 'ENOENT' })
+  assert.equal(submitted.receipt.state, 'WAITING_FOR_APPROVAL')
+  const request = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'run-request.json' })
+  assert.deepEqual(request.planObservedContext, fixture.plan.observedContext)
+  assert.equal(request.projectState.branch, 'parallel-task')
+  assert.notEqual(request.projectState.commit, fixture.plan.observedContext.commit)
+  const baseline = await fixture.store.readJson({ runId: submitted.receipt.runId, name: 'baseline-snapshot.json' })
+  assert.match(baseline.fileHashes['planning-work.txt'], /^[a-f0-9]{64}$/u)
   assert.equal(fixture.calls.executor, 0)
   assert.equal(fixture.calls.test, 0)
 })
@@ -605,7 +611,7 @@ test('an empty claim creates only the fixed Host inbox and reports where to stag
   assert.equal((await fixture.store.listRunIds()).length, 0)
 })
 
-test('a staged plan with stale Git context is retained as a failed Controller run without execution', async t => {
+test('a staged plan with an older Git context is retained and submitted against the current project', async t => {
   const fixture = await createFixture(t)
   const controller = await fixture.createController({ sessionId: 'stale-session' })
   const inbox = join(fixture.artifactRoot, '.m2-inbox')
@@ -617,11 +623,15 @@ test('a staged plan with stale Git context is retained as a failed Controller ru
 
   const result = await controller.submitPendingExternalPlan()
 
-  assert.equal(result.state, 'FAILED')
-  assert.equal(result.diagnostic.code, 'PLAN_CONTEXT_MISMATCH')
+  assert.equal(result.state, 'WAITING_FOR_APPROVAL')
+  assert.equal(result.diagnostic, null)
   assert.equal(fixture.calls.executor, 0)
   assert.equal(fixture.calls.test, 0)
-  assert.equal((await fixture.store.readJson({ runId: result.runId, name: 'run-state.json' })).state, 'FAILED')
+  assert.equal((await fixture.store.readJson({ runId: result.runId, name: 'run-state.json' })).state, 'WAITING_FOR_APPROVAL')
+  const plan = await fixture.store.readJson({ runId: result.runId, name: 'plan.json' })
+  const request = await fixture.store.readJson({ runId: result.runId, name: 'run-request.json' })
+  assert.equal(plan.plan.observedContext.commit, '0'.repeat(40))
+  assert.equal(request.projectState.commit, fixture.plan.observedContext.commit)
   assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-')))
 })
 
@@ -804,7 +814,7 @@ test('a staged Reviewer result with the wrong receipt is rejected by the existin
   assert.notEqual(approved.handoff.reviewReceipt, '0'.repeat(22))
 })
 
-test('a staged Reviewer result is stopped when its evidence is stale', async t => {
+test('a staged Reviewer result records unrelated changes without marking evidence stale', async t => {
   const fixture = await createFixture(t)
   const { submitted, approved } = await createReviewingRun(fixture)
   const inbox = await stageReviewFile(fixture, stagedReview(approved.handoff.reviewReceipt))
@@ -815,9 +825,10 @@ test('a staged Reviewer result is stopped when its evidence is stale', async t =
 
   const result = await (await fixture.createController()).submitPendingExternalReview()
 
-  assert.equal(result.state, 'STOPPED')
-  assert.equal(result.diagnostic.code, 'EVIDENCE_STALE')
-  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'STOPPED')
+  assert.equal(result.state, 'COMPLETE')
+  assert.equal(result.diagnostic, null)
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'COMPLETE')
+  assert.deepEqual((await fixture.store.readJson({ runId: submitted.runId, name: 'review-context.json' })).changedFileNames, ['reviewer-stale.txt'])
   assert.equal(fixture.calls.executor, callsBeforeReview.executor)
   assert.ok((await readdir(inbox)).some(name => name.startsWith('claimed-review-')))
 })
@@ -1046,11 +1057,9 @@ test('session candidate lookup rejects an incompatible persisted manifest state'
 
 test('a settled early failed submission does not block later plans in the same or another session', async t => {
   const fixture = await createFixture(t)
-  const stalePlan = {
-    ...fixture.plan,
-    observedContext: { ...fixture.plan.observedContext, commit: '0'.repeat(40) },
-  }
-  const failed = await (await fixture.createController({ sessionId: 'session-a' })).submitExternalPlan({ plan: stalePlan })
+  const failedController = await fixture.createController({ sessionId: 'session-a' })
+  failedController.preflight = async () => { throw new Error('fixture preflight failure') }
+  const failed = await failedController.submitExternalPlan({ plan: fixture.plan })
   assert.equal(failed.state, 'FAILED')
   assert.equal(failed.summary.hasModifiedProject, false)
   assert.equal(fixture.calls.executor, 0)
@@ -1089,9 +1098,9 @@ test('a settled early failed submission does not block later plans in the same o
 
 test('terminal early failures are skipped only when their finalization records agree', async t => {
   const fixture = await createFixture(t)
-  const failed = await (await fixture.createController()).submitExternalPlan({
-    plan: { ...fixture.plan, observedContext: { ...fixture.plan.observedContext, commit: '0'.repeat(40) } },
-  })
+  const failedController = await fixture.createController()
+  failedController.preflight = async () => { throw new Error('fixture preflight failure') }
+  const failed = await failedController.submitExternalPlan({ plan: fixture.plan })
   assert.equal(failed.state, 'FAILED')
   const manifest = await fixture.store.readJson({ runId: failed.runId, name: 'run-manifest.json' })
   const summaryDescriptor = manifest.artifacts.find(artifact => artifact.name === 'run-summary.json')
@@ -1373,22 +1382,28 @@ test('M2 approval rejects a changed plan artifact before calling DSH', async t =
   assert.equal(fixture.calls.test, 0)
 })
 
-test('M2 approval stops when project context changes after plan submission', async t => {
+test('M2 approval uses the current project after unrelated changes and a commit', async t => {
   const fixture = await createFixture(t)
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
-  await writeFile(join(fixture.projectRoot, 'unexpected.txt'), 'changed after plan\n')
+  await writeFile(join(fixture.projectRoot, 'parallel.txt'), 'changed after plan\n')
+  runGit(fixture.projectRoot, ['add', 'parallel.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'parallel task after planning'])
 
-  const stopped = await (await fixture.createController()).approveExternalPlan({
+  const approved = await (await fixture.createController()).approveExternalPlan({
     runId: submitted.runId,
     planSha256: submitted.handoff.planSha256,
   })
 
-  assert.equal(stopped.state, 'STOPPED')
-  assert.equal(stopped.diagnostic.code, 'PROJECT_CONTEXT_CHANGED')
-  assert.equal(fixture.calls.executor, 0)
+  assert.equal(approved.state, 'REVIEWING', JSON.stringify(approved.diagnostic))
+  assert.equal(approved.diagnostic, null)
+  assert.deepEqual(approved.summary.changedFileNames, ['result.txt'])
+  assert.equal(await readFile(join(fixture.projectRoot, 'parallel.txt'), 'utf8'), 'changed after plan\n')
+  const baseline = await fixture.store.readJson({ runId: submitted.runId, name: 'execution-baseline-snapshot.json' })
+  assert.match(baseline.fileHashes['parallel.txt'], /^[a-f0-9]{64}$/u)
+  assert.doesNotMatch(await readFile(join(fixture.artifactRoot, submitted.runId, 'git-diff.patch'), 'utf8'), /parallel\.txt/)
 })
 
-test('M2 external review stops if the project changed after evidence collection', async t => {
+test('M2 review records unrelated commits after evidence without marking evidence stale', async t => {
   const fixture = await createFixture(t)
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
   const approved = await (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
@@ -1396,17 +1411,40 @@ test('M2 external review stops if the project changed after evidence collection'
   runGit(fixture.projectRoot, ['add', 'reviewer-stale.txt'])
   runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'change after evidence'])
 
+  const completed = await (await fixture.createController()).submitExternalReview({
+    runId: submitted.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'ACCEPTED',
+    summary: 'Unrelated project changes were recorded separately.',
+    findings: [],
+  })
+
+  assert.equal(completed.state, 'COMPLETE', JSON.stringify(completed.diagnostic))
+  assert.equal(completed.diagnostic, null)
+  const reviewContext = await fixture.store.readJson({ runId: submitted.runId, name: 'review-context.json' })
+  assert.deepEqual(reviewContext.changedFileNames, ['reviewer-stale.txt'])
+  assert.deepEqual(reviewContext.changedTaskFileNames, [])
+  assert.equal(fixture.calls.executor, 1)
+})
+
+test('M2 review still rejects changed task files after evidence collection', async t => {
+  const fixture = await createFixture(t)
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const approved = await (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
+  await writeFile(join(fixture.projectRoot, 'result.txt'), 'changed after evidence\n')
+
   const stopped = await (await fixture.createController()).submitExternalReview({
     runId: submitted.runId,
     receipt: approved.handoff.reviewReceipt,
     decision: 'ACCEPTED',
-    summary: 'The previously observed evidence is stale.',
+    summary: 'Task evidence changed after collection.',
     findings: [],
   })
 
   assert.equal(stopped.state, 'STOPPED')
   assert.equal(stopped.diagnostic.code, 'EVIDENCE_STALE')
-  assert.equal(fixture.calls.executor, 1)
+  const reviewContext = await fixture.store.readJson({ runId: submitted.runId, name: 'review-context.json' })
+  assert.deepEqual(reviewContext.changedTaskFileNames, ['result.txt'])
 })
 
 test('M2 ACCEPTED review rejects failed DSH test evidence', async t => {
@@ -1438,41 +1476,30 @@ test('persisted WAITING_FOR_APPROVAL can be explicitly cancelled by a new Contro
   assert.equal(fixture.calls.executor, 0)
 })
 
-test('context-change stop claims approval before it can race with cancellation', async t => {
-  const fixture = await createFixture(t)
+test('unrelated project changes still use the existing approval claim before cancellation', async t => {
+  const approvalClaimWritten = Promise.withResolvers()
+  const approvalClaimGate = Promise.withResolvers()
+  const fixture = await createFixture(t, { approvalClaimWritten, approvalClaimGate: approvalClaimGate.promise })
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
   await writeFile(join(fixture.projectRoot, 'README.md'), 'context changed after plan approval\n')
 
-  const stopWriteStarted = Promise.withResolvers()
-  const stopWriteGate = Promise.withResolvers()
-  const controller = await fixture.createController()
-  const writeJson = controller.store.writeJson.bind(controller.store)
-  controller.store.writeJson = async options => {
-    if (options.name === 'diagnostic.json' && options.source === 'controller-diagnostic') {
-      stopWriteStarted.resolve()
-      await stopWriteGate.promise
-    }
-    return writeJson(options)
-  }
-  const stopping = controller.approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
-  let cancellationError
+  const approving = (await fixture.createController()).approveExternalPlan({ runId: submitted.runId, planSha256: submitted.handoff.planSha256 })
   try {
-    await stopWriteStarted.promise
-    try {
-      await (await fixture.createController()).cancelRun({ runId: submitted.runId })
-    } catch (error) {
-      cancellationError = error
-    }
+    await approvalClaimWritten.promise
+    assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'approval-claim.json' })).action, 'approve')
+    await assert.rejects(
+      () => fixture.createController().then(controller => controller.cancelRun({ runId: submitted.runId })),
+      error => error.code === 'RUN_EXECUTION_STILL_ACTIVE',
+    )
   } finally {
-    stopWriteGate.resolve()
+    approvalClaimGate.resolve()
   }
 
-  const stopped = await stopping
-  assert.equal(cancellationError?.code, 'RUN_EXECUTION_STILL_ACTIVE')
-  assert.equal(stopped.state, 'STOPPED')
-  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'approval-claim.json' })).action, 'stop-context')
-  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'STOPPED')
-  assert.equal(fixture.calls.executor, 0)
+  const approved = await approving
+  assert.equal(approved.state, 'REVIEWING', JSON.stringify(approved.diagnostic))
+  assert.deepEqual(approved.summary.changedFileNames, ['result.txt'])
+  assert.equal((await fixture.store.readJson({ runId: submitted.runId, name: 'run-state.json' })).state, 'REVIEWING')
+  assert.equal(fixture.calls.executor, 1)
 })
 
 test('cancellation cannot overwrite approval finalization after REVIEWING is published', async t => {
@@ -1784,6 +1811,44 @@ test('M2 execution stops when DSH changes a path outside the approved scope', as
   assert.equal(fixture.calls.executor, 1)
 })
 
+test('M2 keeps unrelated changes made during execution as unattributed evidence', async t => {
+  const executorGate = Promise.withResolvers()
+  const executorStarted = Promise.withResolvers()
+  const fixture = await createFixture(t, { executorGate: executorGate.promise, executorStarted })
+  const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
+  const approval = (await fixture.createController()).approveExternalPlan({
+    runId: submitted.runId,
+    planSha256: submitted.handoff.planSha256,
+  })
+
+  await executorStarted.promise
+  await writeFile(join(fixture.projectRoot, 'parallel-during-execution.txt'), 'another task\n')
+  runGit(fixture.projectRoot, ['add', 'parallel-during-execution.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'parallel task during execution'])
+  executorGate.resolve()
+
+  const approved = await approval
+  assert.equal(approved.state, 'REVIEWING', JSON.stringify(approved.diagnostic))
+  assert.deepEqual(approved.summary.changedFileNames, ['parallel-during-execution.txt', 'result.txt'])
+  assert.deepEqual(approved.summary.scopeAssessment.attributedOutOfScopeFileNames, [])
+  assert.deepEqual(approved.summary.scopeAssessment.unattributedOutOfScopeFileNames, ['parallel-during-execution.txt'])
+  await writeFile(join(fixture.projectRoot, 'parallel-during-execution.txt'), 'another task advanced after evidence\n')
+  runGit(fixture.projectRoot, ['add', 'parallel-during-execution.txt'])
+  runGit(fixture.projectRoot, ['commit', '--quiet', '-m', 'parallel task after evidence'])
+
+  const completed = await (await fixture.createController()).submitExternalReview({
+    runId: submitted.runId,
+    receipt: approved.handoff.reviewReceipt,
+    decision: 'ACCEPTED',
+    summary: 'The unrelated file change is recorded and the task change is in scope.',
+    findings: [],
+  })
+  assert.equal(completed.state, 'COMPLETE', JSON.stringify(completed.diagnostic))
+  const reviewContext = await fixture.store.readJson({ runId: submitted.runId, name: 'review-context.json' })
+  assert.deepEqual(reviewContext.changedFileNames, ['parallel-during-execution.txt'])
+  assert.deepEqual(reviewContext.changedTaskFileNames, [])
+})
+
 test('M2 execution allows an in-scope commit and reviews its history without losing prior dirty files', async t => {
   const fixture = await createFixture(t, { createCommit: true, preexistingFile: true })
   const submitted = await (await fixture.createController()).submitExternalPlan({ plan: fixture.plan })
@@ -1942,6 +2007,8 @@ async function createFixture(t, { testOk = true, writeOutsideScope = false, crea
       assert.match(task, /Git operations needed to complete the approved task are permitted under DSH native tool permissions/)
       assert.match(task, /Do not modify files outside the included paths or any excluded path/)
       assert.match(task, /Create result\.txt with the approved fixture output\./)
+      assert.match(task, /Current project context:/)
+      assert.match(task, /Files and commits changed since plan submission:/)
       executorStarted?.resolve()
       if (executorGate) await executorGate
       if (signal?.aborted) throw Object.assign(new Error('fake DSH execution cancelled'), { name: 'AbortError', code: 'CANCELLED' })
@@ -1959,7 +2026,13 @@ async function createFixture(t, { testOk = true, writeOutsideScope = false, crea
         model: 'offline-fixture',
         output: 'FAKE_DSH_EXECUTED',
         stopReason: { kind: 'completed' },
-        events: executorEvents ?? [{ type: 'turn/end', data: { reason: { kind: 'completed' } } }],
+        events: executorEvents ?? [
+          ...(writeResult ? [{ type: 'tool/call', data: { name: 'write', arguments: JSON.stringify({ file_path: 'result.txt' }) } }] : []),
+          ...(writeOutsideScope ? [{ type: 'tool/call', data: { name: 'write', arguments: JSON.stringify({ file_path: 'outside.txt' }) } }] : []),
+          ...(cleanPreexistingOutside ? [{ type: 'tool/call', data: { name: 'bash', arguments: JSON.stringify({ command: 'git clean --force -- outside.txt' }) } }] : []),
+          ...(createCommit ? [{ type: 'tool/call', data: { name: 'bash', arguments: JSON.stringify({ command: stageAll ? 'git add --all && git commit' : 'git add result.txt && git commit' }) } }] : []),
+          { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+        ],
       }
     },
     async executeTest({ runId, round, cwd, command, args }) {
